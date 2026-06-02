@@ -1,28 +1,29 @@
 /*
- * 文件：User/main.c
- * 版本：Bluetooth + 8路灰度循迹精简调参版 + main.c 灰度直读排查版 + presetFast版
+ * File: User/main.c
+ * Version: Bluetooth + 8-channel grayscale tracing + direct grayscale GPIO read
+ *          + presetFast + PB1/PB5 prompt output version.
  *
- * 本版新增：
- *   1. 网页发送 [key,presetFast,down] 可加载高速稳定参数 v1。
- *   2. 物理按键 SW3/K3 可加载高速稳定参数 v1。
- *   3. 加载高速参数只修改参数，不自动启动、不自动切换模式，避免破坏急停/解锁安全逻辑。
+ * Changes in this version:
+ *   1. PC13 board LED is no longer used.
+ *   2. PB1 is used as BEEP output. The buzzer is active-low.
+ *   3. PB5 is used as LED_EXT output. The external LED is active-high.
+ *   4. Existing Prompt_Start()/Prompt_Tick1ms() now drive PB1 and PB5 only.
  *
- * 功能总览：
- *   1. 上电默认进入蓝牙遥控模式。
- *   2. 网页发送 [key,tracing,down] 后进入八路灰度黑线循迹模式。
- *   3. 网页发送 [key,Bluetooth,down] 后回到蓝牙遥控模式。
- *   4. 网页急停 [key,emergency,down] 后立即关闭 PWM，并进入安全锁定。
- *   5. 只有收到 [key,unlock,down] 后才解除锁定，避免误触后小车继续运动。
- *   6. 网页滑杆 [slider,RP,0~100] 用作最大 PWM 百分比限幅。
- *   7. 支持网页滑杆在线调 PID、循迹、速度、滤波、斜坡等重要参数。
- *   8. SW1/K1：把 RP 设置为 0%，PWM 立即清零，但不进入急停锁定。
- *   9. SW2/K2：在蓝牙遥控模式和循迹模式之间切换；急停锁定时无效。
- *   10. SW3/K3：加载高速稳定参数 v1。
+ * Existing behavior kept:
+ *   1. Power-on default mode is Bluetooth remote mode.
+ *   2. [key,tracing,down] enters line tracing mode.
+ *   3. [key,Bluetooth,down] returns to Bluetooth remote mode.
+ *   4. [key,emergency,down] stops PWM immediately and enters safety lock.
+ *   5. [key,unlock,down] releases the safety lock.
+ *   6. [slider,RP,0~100] controls maximum PWM percent.
+ *   7. SW1/K1 sets RP to 0%, clears PWM, but does not enter safety lock.
+ *   8. SW2/K2 switches between Bluetooth mode and tracing mode; locked state blocks it.
+ *   9. [key,presetFast,down] loads fast stable preset v1.
+ *   10. SW3/K3 loads fast stable preset v1.
  */
 
 #include "stm32f10x.h"
 #include "OLED.h"
-#include "LED.h"
 #include "Timer.h"
 #include "Key.h"
 #include "Motor.h"
@@ -36,7 +37,7 @@
 #include <string.h>
 
 /* ================================================================
- * 1. 基础控制周期和安全参数
+ * 1. Basic timing and safety parameters
  * ================================================================ */
 
 #define CONTROL_PERIOD_MS              10U
@@ -48,7 +49,7 @@
 #define PWM_LIMIT_MAX                  ((float)PWM_MAX_DUTY)
 
 /* ================================================================
- * 2. 八路灰度循迹默认参数
+ * 2. Line tracing default parameters
  * ================================================================ */
 
 volatile float g_lineBlackLevelF = 1.0f;
@@ -72,7 +73,7 @@ volatile float g_forwardSlewStep = 3.0f;
 volatile float g_turnSlewStep = 14.0f;
 
 /* ================================================================
- * 3. 速度环/差速环 PID 参数
+ * 3. Speed loop and turn loop PID parameters
  * ================================================================ */
 
 typedef struct
@@ -101,7 +102,7 @@ volatile float g_maxForwardCmd = 70.0f;
 volatile float g_maxTurnCmd = 75.0f;
 
 /* ================================================================
- * 4. 运行状态变量
+ * 4. Runtime states
  * ================================================================ */
 
 typedef enum
@@ -135,7 +136,7 @@ volatile int16_t g_leftPwm = 0;
 volatile int16_t g_rightPwm = 0;
 volatile float g_forwardSpeedError = 0.0f;
 
-/* 保留给旧版 BT_proto.c 链接使用。 */
+/* Kept for compatibility with old BT_proto.c. */
 volatile uint8_t g_sendPlot = 0;
 volatile uint16_t g_sendDisplay = 0;
 
@@ -154,7 +155,7 @@ static volatile float g_lineLastCtrlError = 0.0f;
 static volatile uint16_t g_promptMs = 0;
 
 /* ================================================================
- * 5. 小工具函数
+ * 5. Utility functions
  * ================================================================ */
 
 static float absf_local(float x)
@@ -251,7 +252,94 @@ static int str_is_name(const char *s, const char *a, const char *b, const char *
 }
 
 /* ================================================================
- * 6. PID 和停车控制
+ * 6. PB1 buzzer and PB5 external LED prompt output
+ * ================================================================ */
+
+#define PROMPT_BEEP_PORT       GPIOB
+#define PROMPT_BEEP_PIN        GPIO_Pin_1
+#define PROMPT_LED_PORT        GPIOB
+#define PROMPT_LED_PIN         GPIO_Pin_5
+
+static void PromptIO_BeepOn(void)
+{
+    /* Active-low buzzer: PB1 = 0 means ON. */
+    GPIO_ResetBits(PROMPT_BEEP_PORT, PROMPT_BEEP_PIN);
+}
+
+static void PromptIO_BeepOff(void)
+{
+    GPIO_SetBits(PROMPT_BEEP_PORT, PROMPT_BEEP_PIN);
+}
+
+static void PromptIO_BeepTurn(void)
+{
+    if (GPIO_ReadOutputDataBit(PROMPT_BEEP_PORT, PROMPT_BEEP_PIN))
+    {
+        PromptIO_BeepOn();
+    }
+    else
+    {
+        PromptIO_BeepOff();
+    }
+}
+
+static void PromptIO_LedOn(void)
+{
+    /* Active-high LED: PB5 = 1 means ON. */
+    GPIO_SetBits(PROMPT_LED_PORT, PROMPT_LED_PIN);
+}
+
+static void PromptIO_LedOff(void)
+{
+    GPIO_ResetBits(PROMPT_LED_PORT, PROMPT_LED_PIN);
+}
+
+static void PromptIO_LedTurn(void)
+{
+    if (GPIO_ReadOutputDataBit(PROMPT_LED_PORT, PROMPT_LED_PIN))
+    {
+        PromptIO_LedOff();
+    }
+    else
+    {
+        PromptIO_LedOn();
+    }
+}
+
+static void PromptIO_AllOn(void)
+{
+    PromptIO_BeepOn();
+    PromptIO_LedOn();
+}
+
+static void PromptIO_AllOff(void)
+{
+    PromptIO_BeepOff();
+    PromptIO_LedOff();
+}
+
+static void PromptIO_AllTurn(void)
+{
+    PromptIO_BeepTurn();
+    PromptIO_LedTurn();
+}
+
+static void PromptIO_Init(void)
+{
+    GPIO_InitTypeDef GPIO_InitStructure;
+
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOB, ENABLE);
+
+    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_Out_PP;
+    GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_InitStructure.GPIO_Pin = PROMPT_BEEP_PIN | PROMPT_LED_PIN;
+    GPIO_Init(GPIOB, &GPIO_InitStructure);
+
+    PromptIO_AllOff();
+}
+
+/* ================================================================
+ * 7. PID and stop control
  * ================================================================ */
 
 static void PID_Reset(PID_TypeDef *pid)
@@ -346,7 +434,7 @@ static void Control_ForcePWMZero(void)
 static void Prompt_Start(uint16_t ms)
 {
     g_promptMs = ms;
-    LED_ON();
+    PromptIO_AllOn();
 }
 
 static void Prompt_Tick1ms(void)
@@ -356,17 +444,17 @@ static void Prompt_Tick1ms(void)
         g_promptMs--;
         if ((g_promptMs % 80U) == 0U)
         {
-            LED_Turn();
+            PromptIO_AllTurn();
         }
         if (g_promptMs == 0U)
         {
-            LED_OFF();
+            PromptIO_AllOff();
         }
     }
 }
 
 /* ================================================================
- * 7. 模式切换和急停接口
+ * 8. Mode switching and safety lock
  * ================================================================ */
 
 void App_EmergencyStop(void)
@@ -421,7 +509,7 @@ void App_StartTracingMode(void)
 }
 
 /* ================================================================
- * 8. 蓝牙/网页协议解析
+ * 9. Bluetooth/web packet parser
  * ================================================================ */
 
 static void ApplySpeedLimitPercent(float percent)
@@ -438,9 +526,6 @@ static void ApplySpeedLimitPercent(float percent)
 
 static void ApplyFastPreset(void)
 {
-    /* 高速稳定参数 v1 / 约 5.2s 圈速版。
-     * 只加载调参参数，不自动切换模式，不自动启动小车。
-     */
     ApplySpeedLimitPercent(55.0f);
 
     g_traceBaseSpeed = 60.0f;
@@ -780,7 +865,7 @@ static void Main_BTProcess(void)
 }
 
 /* ================================================================
- * 9. 八路灰度循迹算法 + main.c GPIO 直读
+ * 10. 8-channel grayscale tracing with direct GPIO read
  * ================================================================ */
 
 #define LINE_AD0_PORT      GPIOA
@@ -1049,7 +1134,7 @@ static void Tracing_Control10ms(void)
 }
 
 /* ================================================================
- * 10. 速度闭环、电机输出、显示和按键
+ * 11. Speed loop, motor output, display and keys
  * ================================================================ */
 
 static void Control_Run10ms(void)
@@ -1206,27 +1291,26 @@ static void Main_KeyProcess(void)
 }
 
 /* ================================================================
- * 11. 主函数和 1ms 定时中断
+ * 12. Main function and 1 ms timer interrupt
  * ================================================================ */
 
 int main(void)
 {
     OLED_Init();
-    LED_Init();
     Key_Init();
     Grayscale_Init();
     Motor_Init();
     Encoder_Init();
 
-    /* 放在可能碰到 AFIO/JTAG/GPIO 的初始化后面，再强制配置一次灰度接口。 */
     Line_GPIOForceInit();
+    PromptIO_Init();
 
     Serial_Init();
     Timer_Init();
     Control_Init();
 
     ApplySpeedLimitPercent(g_btSpeedLimitPercent);
-    LED_OFF();
+    PromptIO_AllOff();
 
     OLED_Printf(0, 0, OLED_8X16, "BT/Trace Car");
     OLED_Printf(0, 16, OLED_8X16, "Default: BT");
