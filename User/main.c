@@ -1,25 +1,28 @@
 /*
- * File: User/main.c
- * Version: Bluetooth + 8-channel grayscale tracing + direct grayscale GPIO read
- *          + presetFast + PB1/PB5 prompt output version.
+ * 文件：User/main.c
+ * 版本：蓝牙遥控 + 八路灰度循迹 + presetFast + PB1/PB5 声光提示 + 编码器累计调试版。
  *
- * Changes in this version:
- *   1. PC13 board LED is no longer used.
- *   2. PB1 is used as BEEP output. The buzzer is active-low.
- *   3. PB5 is used as LED_EXT output. The external LED is active-high.
- *   4. Existing Prompt_Start()/Prompt_Tick1ms() now drive PB1 and PB5 only.
+ * 本版说明：
+ *   1. 不再使用 PC13 板载 LED。
+ *   2. PB1 用作 BEEP 蜂鸣器输出，蜂鸣器为低电平触发。
+ *   3. PB5 用作 LED_EXT 外接提示灯输出，LED 为高电平点亮。
+ *   4. Prompt_Start()/Prompt_Tick1ms() 只控制 PB1 和 PB5。
+ *   5. 新增编码器累计调试模式，用于 100 cm 距离标定。
+ *   6. 开机默认普通 BT 模式，按下 K2/SW2 后切换到编码器调试模式；
+ *      再按一次 K2/SW2 返回普通 BT 显示模式。
  *
- * Existing behavior kept:
- *   1. Power-on default mode is Bluetooth remote mode.
- *   2. [key,tracing,down] enters line tracing mode.
- *   3. [key,Bluetooth,down] returns to Bluetooth remote mode.
- *   4. [key,emergency,down] stops PWM immediately and enters safety lock.
- *   5. [key,unlock,down] releases the safety lock.
- *   6. [slider,RP,0~100] controls maximum PWM percent.
- *   7. SW1/K1 sets RP to 0%, clears PWM, but does not enter safety lock.
- *   8. SW2/K2 switches between Bluetooth mode and tracing mode; locked state blocks it.
- *   9. [key,presetFast,down] loads fast stable preset v1.
- *   10. SW3/K3 loads fast stable preset v1.
+ * 保留功能：
+ *   1. 上电默认进入蓝牙遥控模式。
+ *   2. 网页发送 [key,tracing,down] 进入八路灰度循迹模式。
+ *   3. 网页发送 [key,Bluetooth,down] 返回蓝牙遥控模式。
+ *   4. 网页发送 [key,emergency,down] 立即清零 PWM 并进入急停锁定。
+ *   5. 网页发送 [key,unlock,down] 解除急停锁定。
+ *   6. 网页发送 [slider,RP,0~100] 控制最大 PWM 百分比。
+ *   7. K1/SW1 将 RP 设为 0%，PWM 清零，但不进入急停锁定。
+ *   8. K2/SW2 在普通 BT 显示模式和编码器调试显示模式之间切换。
+ *   9. 网页发送 [key,presetFast,down] 加载高速稳定参数 v1。
+ *   10. K3/SW3 加载高速稳定参数 v1。
+ *   11. K4/SW4 清零编码器累计脉冲。
  */
 
 #include "stm32f10x.h"
@@ -37,7 +40,7 @@
 #include <string.h>
 
 /* ================================================================
- * 1. Basic timing and safety parameters
+ * 1. 基础控制周期和安全参数
  * ================================================================ */
 
 #define CONTROL_PERIOD_MS              10U
@@ -49,7 +52,7 @@
 #define PWM_LIMIT_MAX                  ((float)PWM_MAX_DUTY)
 
 /* ================================================================
- * 2. Line tracing default parameters
+ * 2. 八路灰度循迹默认参数
  * ================================================================ */
 
 volatile float g_lineBlackLevelF = 1.0f;
@@ -73,7 +76,7 @@ volatile float g_forwardSlewStep = 3.0f;
 volatile float g_turnSlewStep = 14.0f;
 
 /* ================================================================
- * 3. Speed loop and turn loop PID parameters
+ * 3. 速度环和转向环 PID 参数
  * ================================================================ */
 
 typedef struct
@@ -102,7 +105,7 @@ volatile float g_maxForwardCmd = 70.0f;
 volatile float g_maxTurnCmd = 75.0f;
 
 /* ================================================================
- * 4. Runtime states
+ * 4. 运行状态变量
  * ================================================================ */
 
 typedef enum
@@ -129,6 +132,15 @@ volatile float g_rightSpeed = 0.0f;
 volatile float g_forwardSpeed = 0.0f;
 volatile float g_turnSpeed = 0.0f;
 
+/* 编码器距离调试累计值，在 Control_Run10ms() 中每 10ms 更新一次。 */
+volatile int32_t g_leftEncoderTotal = 0;
+volatile int32_t g_rightEncoderTotal = 0;
+volatile int32_t g_forwardEncoderTotal = 0;
+volatile int32_t g_turnEncoderTotal = 0;
+
+/* 0 = 普通网页回传，1 = 编码器调试回传。 */
+volatile uint8_t g_plotMode = 0;
+
 volatile float g_speedPwm = 0.0f;
 volatile float g_diffPwm = 0.0f;
 
@@ -136,7 +148,7 @@ volatile int16_t g_leftPwm = 0;
 volatile int16_t g_rightPwm = 0;
 volatile float g_forwardSpeedError = 0.0f;
 
-/* Kept for compatibility with old BT_proto.c. */
+/* 保留该变量，用于兼容旧版 BT_proto.c 的链接引用。 */
 volatile uint8_t g_sendPlot = 0;
 volatile uint16_t g_sendDisplay = 0;
 
@@ -155,7 +167,7 @@ static volatile float g_lineLastCtrlError = 0.0f;
 static volatile uint16_t g_promptMs = 0;
 
 /* ================================================================
- * 5. Utility functions
+ * 5. 小工具函数
  * ================================================================ */
 
 static float absf_local(float x)
@@ -252,7 +264,7 @@ static int str_is_name(const char *s, const char *a, const char *b, const char *
 }
 
 /* ================================================================
- * 6. PB1 buzzer and PB5 external LED prompt output
+ * 6. PB1 蜂鸣器与 PB5 外接 LED 声光提示输出
  * ================================================================ */
 
 #define PROMPT_BEEP_PORT       GPIOB
@@ -262,7 +274,7 @@ static int str_is_name(const char *s, const char *a, const char *b, const char *
 
 static void PromptIO_BeepOn(void)
 {
-    /* Active-low buzzer: PB1 = 0 means ON. */
+    /* 蜂鸣器为低电平触发：PB1 = 0 时响。 */
     GPIO_ResetBits(PROMPT_BEEP_PORT, PROMPT_BEEP_PIN);
 }
 
@@ -285,7 +297,7 @@ static void PromptIO_BeepTurn(void)
 
 static void PromptIO_LedOn(void)
 {
-    /* Active-high LED: PB5 = 1 means ON. */
+    /* 外接 LED 为高电平点亮：PB5 = 1 时亮。 */
     GPIO_SetBits(PROMPT_LED_PORT, PROMPT_LED_PIN);
 }
 
@@ -339,7 +351,7 @@ static void PromptIO_Init(void)
 }
 
 /* ================================================================
- * 7. PID and stop control
+ * 7. PID 和停车控制
  * ================================================================ */
 
 static void PID_Reset(PID_TypeDef *pid)
@@ -453,8 +465,24 @@ static void Prompt_Tick1ms(void)
     }
 }
 
+static void Encoder_DebugClearTotals(void)
+{
+    __disable_irq();
+
+    g_leftEncoderTotal = 0;
+    g_rightEncoderTotal = 0;
+    g_forwardEncoderTotal = 0;
+    g_turnEncoderTotal = 0;
+
+    Encoder_ClearAll();
+
+    __enable_irq();
+
+    Prompt_Start(180);
+}
+
 /* ================================================================
- * 8. Mode switching and safety lock
+ * 8. 模式切换和安全锁定
  * ================================================================ */
 
 void App_EmergencyStop(void)
@@ -509,7 +537,7 @@ void App_StartTracingMode(void)
 }
 
 /* ================================================================
- * 9. Bluetooth/web packet parser
+ * 9. 蓝牙/网页数据包解析
  * ================================================================ */
 
 static void ApplySpeedLimitPercent(float percent)
@@ -696,6 +724,11 @@ static void Main_ApplySliderPacket(const char *name, float value)
         g_lineReverseOrderF = (value <= 0.0f) ? 0.0f : 1.0f;
         return;
     }
+    if (str_is_name(name, "plotMode", "debugMode", "dbg"))
+    {
+        g_plotMode = (value >= 0.5f) ? 1U : 0U;
+        return;
+    }
 }
 
 static void Main_ApplyJoystickPacket(char **tok, int n)
@@ -766,6 +799,23 @@ static void Main_ApplyPacket(char *payload)
             if (str_is_name(tok[1], "presetFast", "fast", "fastPreset"))
             {
                 ApplyFastPreset();
+                return;
+            }
+            if (str_is_name(tok[1], "encClear", "encoderClear", "clearEnc"))
+            {
+                Encoder_DebugClearTotals();
+                return;
+            }
+            if (str_is_name(tok[1], "encDebug", "encoderDebug", "encDbg"))
+            {
+                g_plotMode = 1U;
+                Encoder_DebugClearTotals();
+                return;
+            }
+            if (str_is_name(tok[1], "plotNormal", "normalPlot", "plot0"))
+            {
+                g_plotMode = 0U;
+                Prompt_Start(160);
                 return;
             }
             if (str_is_name(tok[1], "tracing", "trace", "line"))
@@ -865,7 +915,7 @@ static void Main_BTProcess(void)
 }
 
 /* ================================================================
- * 10. 8-channel grayscale tracing with direct GPIO read
+ * 10. 八路灰度循迹算法与 GPIO 直读
  * ================================================================ */
 
 #define LINE_AD0_PORT      GPIOA
@@ -1134,7 +1184,7 @@ static void Tracing_Control10ms(void)
 }
 
 /* ================================================================
- * 11. Speed loop, motor output, display and keys
+ * 11. 速度闭环、电机输出、显示和按键
  * ================================================================ */
 
 static void Control_Run10ms(void)
@@ -1147,6 +1197,11 @@ static void Control_Run10ms(void)
 
     leftDelta = Encoder_GetLeftDelta();
     rightDelta = Encoder_GetRightDelta();
+
+    g_leftEncoderTotal += leftDelta;
+    g_rightEncoderTotal += rightDelta;
+    g_forwardEncoderTotal = (g_leftEncoderTotal + g_rightEncoderTotal) / 2;
+    g_turnEncoderTotal = (g_rightEncoderTotal - g_leftEncoderTotal) / 2;
 
     g_leftSpeed = (float)leftDelta;
     g_rightSpeed = (float)rightDelta;
@@ -1224,6 +1279,35 @@ static void Serial_SendPlotStatus(void)
 
     modeCode = g_safetyLocked ? 9 : (int)g_workMode;
 
+    if (g_plotMode == 1U)
+    {
+        /*
+         * 编码器调试模式下的网页绘图回传格式：
+         * CH1  modeCode：0=蓝牙遥控，1=循迹，9=急停锁定
+         * CH2  左轮最近 10ms 编码器增量
+         * CH3  右轮最近 10ms 编码器增量
+         * CH4  实际前进速度
+         * CH5  实际转向速度
+         * CH6  目标前进速度
+         * CH7  目标转向速度
+         * CH8  左轮累计脉冲
+         * CH9  右轮累计脉冲
+         * CH10 左右平均累计脉冲
+         */
+        Serial_Printf("[p,%d,%d,%d,%d,%d,%d,%d,%ld,%ld,%ld]\r\n",
+                      modeCode,
+                      (int)g_leftSpeed,
+                      (int)g_rightSpeed,
+                      (int)g_forwardSpeed,
+                      (int)g_turnSpeed,
+                      (int)g_targetForwardSpeed,
+                      (int)g_targetTurnSpeed,
+                      (long)g_leftEncoderTotal,
+                      (long)g_rightEncoderTotal,
+                      (long)g_forwardEncoderTotal);
+        return;
+    }
+
     Serial_Printf("[p,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d]\r\n",
                   modeCode,
                   (int)g_lineError,
@@ -1239,6 +1323,16 @@ static void Serial_SendPlotStatus(void)
 
 static void OLED_ShowStatus(void)
 {
+    if (g_plotMode == 1U)
+    {
+        OLED_Printf(0, 0, OLED_8X16, "ENC RP:%03d", (int)g_btSpeedLimitPercent);
+        OLED_Printf(0, 16, OLED_8X16, "Ld:%+04d Rd:%+04d", (int)g_leftSpeed, (int)g_rightSpeed);
+        OLED_Printf(0, 32, OLED_8X16, "L:%+06ld", (long)g_leftEncoderTotal);
+        OLED_Printf(0, 48, OLED_8X16, "R:%+06ld A:%+06ld", (long)g_rightEncoderTotal, (long)g_forwardEncoderTotal);
+        OLED_Update();
+        return;
+    }
+
     OLED_Printf(0, 0, OLED_8X16, "M:%s LK:%d RP:%03d", ModeString(), (int)g_safetyLocked, (int)g_btSpeedLimitPercent);
     OLED_Printf(0, 16, OLED_8X16, "T:%+04d V:%+04d", (int)g_targetForwardSpeed, (int)g_forwardSpeed);
     OLED_Printf(0, 32, OLED_8X16, "L:%+04d R:%+04d", (int)g_leftPwm, (int)g_rightPwm);
@@ -1272,12 +1366,24 @@ static void Main_KeyProcess(void)
             return;
         }
 
-        if (g_workMode == WORK_BT)
+        /*
+         * K2/SW2 改为编码器调试模式切换键：
+         *   开机默认 g_plotMode=0，即普通 BT 显示/回传模式；
+         *   第一次按 K2：切换到编码器调试显示/回传模式，并清零累计脉冲；
+         *   再按一次 K2：返回普通 BT 显示/回传模式。
+         * 注意：编码器调试模式本质上仍保持 WORK_BT，便于用网页摇杆低速行驶做标定。
+         */
+        if (g_plotMode == 0U)
         {
-            App_StartTracingMode();
+            g_workMode = WORK_BT;
+            g_plotMode = 1U;
+            g_lastCmdTickMs = 0;
+            Control_ForcePWMZero();
+            Encoder_DebugClearTotals();
         }
         else
         {
+            g_plotMode = 0U;
             App_StartBluetoothMode();
         }
         return;
@@ -1288,10 +1394,16 @@ static void Main_KeyProcess(void)
         ApplyFastPreset();
         return;
     }
+
+    if (key == 4U)
+    {
+        Encoder_DebugClearTotals();
+        return;
+    }
 }
 
 /* ================================================================
- * 12. Main function and 1 ms timer interrupt
+ * 12. 主函数和 1ms 定时中断
  * ================================================================ */
 
 int main(void)
@@ -1302,6 +1414,7 @@ int main(void)
     Motor_Init();
     Encoder_Init();
 
+    /* 先强制配置灰度接口，再初始化 PB1/PB5 声光提示输出。 */
     Line_GPIOForceInit();
     PromptIO_Init();
 
