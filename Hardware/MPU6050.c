@@ -287,10 +287,16 @@ uint8_t MPU6050_Init(void)
     MPU6050_DelayMs(100);
 
     id = MPU6050_GetID();
-    if (id != 0x68U)
-    {
-        return MPU6050_ERR_ID;
-    }
+
+/*
+ * 常见 MPU6050 的 WHO_AM_I 为 0x68。
+ * 部分兼容模块或 MPU6500 类芯片会返回 0x70。
+ * 当前模块实测 WHO_AM_I = 0x70，因此这里同时接受 0x68 和 0x70。
+ */
+		if (id != 0x68U && id != 0x70U)
+		{
+				return MPU6050_ERR_ID;
+		}
 
     /* Wake up, choose X gyro PLL clock. */
     err = MPU6050_WriteReg(MPU6050_REG_PWR_MGMT_1, 0x01U);

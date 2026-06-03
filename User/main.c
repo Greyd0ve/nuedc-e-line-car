@@ -1,14 +1,17 @@
 /*
  * 文件：User/main.c
- * 版本：蓝牙遥控 + 八路灰度循迹 + presetFast + PB1/PB5 声光提示 + 编码器累计调试版。
+ * 版本：蓝牙遥控 + 八路灰度循迹 + presetFast + PB1/PB5 声光提示
+ *       + 编码器累计调试 + MPU6050 yaw 诊断调试版。
  *
  * 本版说明：
  *   1. 不再使用 PC13 板载 LED。
  *   2. PB1 用作 BEEP 蜂鸣器输出，蜂鸣器为低电平触发。
  *   3. PB5 用作 LED_EXT 外接提示灯输出，LED 为高电平点亮。
  *   4. Prompt_Start()/Prompt_Tick1ms() 只控制 PB1 和 PB5。
- *   5. 新增编码器累计调试模式，用于 100 cm 距离标定。
- *   6. 开机默认普通 BT 模式，按下 K2/SW2 后切换到编码器调试模式；
+ *   5. 保留编码器累计调试模式，用于 100 cm 距离标定。
+ *   6. 新增 MPU6050 yaw 调试模式，用于 GyroZ 零偏校准、yaw 积分和网页/OLED 回传。
+ *   7. 新增 MPU6050 诊断信息：错误码、WHO_AM_I 读数、初始化尝试次数。
+ *   7. 开机默认普通 BT 模式，按下 K2/SW2 后切换到编码器调试模式；
  *      再按一次 K2/SW2 返回普通 BT 显示模式。
  *
  * 保留功能：
@@ -34,6 +37,7 @@
 #include "Serial.h"
 #include "Grayscale.h"
 #include "PWM.h"
+#include "MPU6050.h"
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -47,9 +51,14 @@
 #define BT_TIMEOUT_MS                  600U
 #define PLOT_REPORT_PERIOD_MS          100U
 #define OLED_REFRESH_PERIOD_MS         100U
+#define MPU_UPDATE_PERIOD_MS           10U
 
 #define PWM_LIMIT_MIN                  0.0f
 #define PWM_LIMIT_MAX                  ((float)PWM_MAX_DUTY)
+
+/* MPU6050 静止校准参数：300 次，每次约 3ms，总时长约 0.9s。 */
+#define MPU_CALIB_SAMPLES              300U
+#define MPU_CALIB_MIN_OK               240U
 
 /* ================================================================
  * 2. 八路灰度循迹默认参数
@@ -138,7 +147,7 @@ volatile int32_t g_rightEncoderTotal = 0;
 volatile int32_t g_forwardEncoderTotal = 0;
 volatile int32_t g_turnEncoderTotal = 0;
 
-/* 0 = 普通网页回传，1 = 编码器调试回传。 */
+/* 0 = 普通网页回传，1 = 编码器调试回传，2 = MPU6050 yaw 调试回传。 */
 volatile uint8_t g_plotMode = 0;
 
 volatile float g_speedPwm = 0.0f;
@@ -154,6 +163,7 @@ volatile uint16_t g_sendDisplay = 0;
 
 volatile uint16_t g_oledRefreshMs = 0;
 volatile uint16_t g_plotReportMs = 0;
+volatile uint16_t g_mpuUpdateMs = 0;
 
 volatile int16_t g_lineError = 0;
 volatile uint8_t g_lineValid = 0;
@@ -165,6 +175,27 @@ volatile uint16_t g_lineLostMs = 0;
 static volatile float g_lineErrorFiltered = 0.0f;
 static volatile float g_lineLastCtrlError = 0.0f;
 static volatile uint16_t g_promptMs = 0;
+
+/* MPU6050 yaw 调试状态。 */
+volatile uint8_t g_mpuReady = 0;
+volatile uint8_t g_mpuErr = 0;
+volatile uint8_t g_mpuCalibrated = 0;
+volatile uint8_t g_mpuCalibrating = 0;
+
+/* MPU6050 诊断信息：
+ *   g_mpuWhoAmI = WHO_AM_I 寄存器读数，正常应为 0x68。
+ *   g_mpuInitTryCount = 调用 MPU_AppInit() 的次数，方便确认命令是否真的触发。
+ */
+volatile uint8_t g_mpuWhoAmI = 0x00U;
+volatile uint8_t g_mpuInitTryCount = 0U;
+
+/* 如果实测逆时针旋转时 yaw 方向相反，可通过 [slider,yawSign,-1] 取反。 */
+volatile float g_mpuYawSign = 1.0f;
+volatile float g_gyroZRawDps = 0.0f;
+volatile float g_gyroZBiasDps = 0.0f;
+volatile float g_gyroZDps = 0.0f;
+volatile float g_yawDeg = 0.0f;
+volatile float g_yawTotalDeg = 0.0f;
 
 /* ================================================================
  * 5. 小工具函数
@@ -216,6 +247,33 @@ static float slew_float(float current, float target, float maxStep)
         return current - maxStep;
     }
     return target;
+}
+
+static float wrap_180(float angle)
+{
+    while (angle > 180.0f)
+    {
+        angle -= 360.0f;
+    }
+    while (angle < -180.0f)
+    {
+        angle += 360.0f;
+    }
+    return angle;
+}
+
+static void Main_DelayMs(uint16_t ms)
+{
+    uint16_t i;
+    volatile uint16_t j;
+
+    for (i = 0; i < ms; i++)
+    {
+        for (j = 0; j < 7200U; j++)
+        {
+            __NOP();
+        }
+    }
 }
 
 static char ascii_lower_char(char c)
@@ -351,7 +409,7 @@ static void PromptIO_Init(void)
 }
 
 /* ================================================================
- * 7. PID 和停车控制
+ * 7. PID、停车控制、提示和编码器清零
  * ================================================================ */
 
 static void PID_Reset(PID_TypeDef *pid)
@@ -482,7 +540,149 @@ static void Encoder_DebugClearTotals(void)
 }
 
 /* ================================================================
- * 8. 模式切换和安全锁定
+ * 8. MPU6050 yaw 读取、积分和零偏校准
+ * ================================================================ */
+
+static void MPU_ResetYaw(void)
+{
+    g_yawDeg = 0.0f;
+    g_yawTotalDeg = 0.0f;
+}
+
+static void MPU_AppInit(void)
+{
+    /*
+     * 诊断流程：
+     *   1. 先初始化 PB8/PB9 软件 I2C 总线；
+     *   2. 直接读取 WHO_AM_I，正常 MPU6050 应返回 0x68；
+     *   3. 再执行完整 MPU6050_Init()，配置采样率、滤波和量程；
+     *   4. 将错误码、WHO_AM_I 和 ready 标志回传到网页/OLED。
+     */
+    if (g_mpuInitTryCount < 255U)
+    {
+        g_mpuInitTryCount++;
+    }
+
+    MPU6050_InitBus();
+    Main_DelayMs(20);
+    g_mpuWhoAmI = MPU6050_GetID();
+
+    g_mpuErr = MPU6050_Init();
+
+    if (g_mpuErr == MPU6050_OK)
+    {
+        g_mpuReady = 1;
+        g_mpuCalibrated = 0;
+        g_gyroZRawDps = 0.0f;
+        g_gyroZBiasDps = 0.0f;
+        g_gyroZDps = 0.0f;
+        MPU_ResetYaw();
+    }
+    else
+    {
+        g_mpuReady = 0;
+        g_mpuCalibrated = 0;
+    }
+}
+
+static void MPU_UpdateYaw(uint16_t elapsedMs)
+{
+    MPU6050_Data_t data;
+    float dt;
+
+    if (!g_mpuReady || g_mpuCalibrating)
+    {
+        return;
+    }
+
+    if (elapsedMs == 0U)
+    {
+        return;
+    }
+
+    if (elapsedMs > 50U)
+    {
+        elapsedMs = 50U;
+    }
+
+    if (MPU6050_ReadData(&data) != MPU6050_OK)
+    {
+        g_mpuReady = 0;
+        g_mpuErr = 0xE1U;
+        return;
+    }
+
+    dt = (float)elapsedMs * 0.001f;
+
+    g_gyroZRawDps = data.GyroZ_dps;
+    g_gyroZDps = (data.GyroZ_dps - g_gyroZBiasDps) * g_mpuYawSign;
+
+    g_yawTotalDeg += g_gyroZDps * dt;
+    g_yawDeg = wrap_180(g_yawDeg + g_gyroZDps * dt);
+}
+
+static void MPU_CalibrateGyroZ(void)
+{
+    MPU6050_Data_t data;
+    uint16_t i;
+    uint16_t okCount;
+    float sum;
+
+    /* 校准必须保持静止，并强制回到蓝牙模式停车，避免车在校准时运动。 */
+    g_workMode = WORK_BT;
+    Control_ForcePWMZero();
+
+    g_mpuCalibrating = 1;
+    g_mpuCalibrated = 0;
+    Prompt_Start(600);
+
+    if (!g_mpuReady)
+    {
+        MPU_AppInit();
+    }
+
+    if (!g_mpuReady)
+    {
+        g_mpuCalibrating = 0;
+        return;
+    }
+
+    sum = 0.0f;
+    okCount = 0;
+
+    for (i = 0; i < MPU_CALIB_SAMPLES; i++)
+    {
+        if (MPU6050_ReadData(&data) == MPU6050_OK)
+        {
+            sum += data.GyroZ_dps;
+            okCount++;
+        }
+
+        Main_DelayMs(3);
+    }
+
+    if (okCount >= MPU_CALIB_MIN_OK)
+    {
+        g_gyroZBiasDps = sum / (float)okCount;
+        g_gyroZRawDps = g_gyroZBiasDps;
+        g_gyroZDps = 0.0f;
+        MPU_ResetYaw();
+        g_mpuCalibrated = 1;
+        g_mpuErr = MPU6050_OK;
+        Prompt_Start(300);
+    }
+    else
+    {
+        g_mpuErr = 0xE2U;
+        Prompt_Start(900);
+    }
+
+    g_mpuUpdateMs = 0;
+    g_mpuCalibrating = 0;
+}
+
+/* ================================================================
+ * 9. 模式切换和安全锁定
  * ================================================================ */
 
 void App_EmergencyStop(void)
@@ -537,7 +737,7 @@ void App_StartTracingMode(void)
 }
 
 /* ================================================================
- * 9. 蓝牙/网页数据包解析
+ * 10. 蓝牙/网页数据包解析
  * ================================================================ */
 
 static void ApplySpeedLimitPercent(float percent)
@@ -726,7 +926,23 @@ static void Main_ApplySliderPacket(const char *name, float value)
     }
     if (str_is_name(name, "plotMode", "debugMode", "dbg"))
     {
-        g_plotMode = (value >= 0.5f) ? 1U : 0U;
+        if (value < 0.5f)
+        {
+            g_plotMode = 0U;
+        }
+        else if (value < 1.5f)
+        {
+            g_plotMode = 1U;
+        }
+        else
+        {
+            g_plotMode = 2U;
+        }
+        return;
+    }
+    if (str_is_name(name, "yawSign", "gyroSign", "mpuSign"))
+    {
+        g_mpuYawSign = (value < 0.0f) ? -1.0f : 1.0f;
         return;
     }
 }
@@ -810,6 +1026,28 @@ static void Main_ApplyPacket(char *payload)
             {
                 g_plotMode = 1U;
                 Encoder_DebugClearTotals();
+                return;
+            }
+            if (str_is_name(tok[1], "mpuDebug", "gyroDebug", "yawDebug"))
+            {
+                g_plotMode = 2U;
+                if (!g_mpuReady)
+                {
+                    MPU_AppInit();
+                }
+                Prompt_Start(180);
+                return;
+            }
+            if (str_is_name(tok[1], "mpuCalib", "gyroCalib", "calib"))
+            {
+                g_plotMode = 2U;
+                MPU_CalibrateGyroZ();
+                return;
+            }
+            if (str_is_name(tok[1], "yawZero", "mpuZero", "zeroYaw"))
+            {
+                MPU_ResetYaw();
+                Prompt_Start(180);
                 return;
             }
             if (str_is_name(tok[1], "plotNormal", "normalPlot", "plot0"))
@@ -915,7 +1153,7 @@ static void Main_BTProcess(void)
 }
 
 /* ================================================================
- * 10. 八路灰度循迹算法与 GPIO 直读
+ * 11. 八路灰度循迹算法与 GPIO 直读
  * ================================================================ */
 
 #define LINE_AD0_PORT      GPIOA
@@ -1184,7 +1422,7 @@ static void Tracing_Control10ms(void)
 }
 
 /* ================================================================
- * 11. 速度闭环、电机输出、显示和按键
+ * 12. 速度闭环、电机输出、显示和按键
  * ================================================================ */
 
 static void Control_Run10ms(void)
@@ -1308,6 +1546,35 @@ static void Serial_SendPlotStatus(void)
         return;
     }
 
+    if (g_plotMode == 2U)
+    {
+        /*
+         * MPU6050 诊断/调试模式下的网页绘图回传格式：
+         * CH1  modeCode：0=蓝牙遥控，1=循迹，9=急停锁定
+         * CH2  yaw * 10，单位 0.1 度
+         * CH3  扣零偏后的 GyroZ * 10，单位 0.1 度/秒
+         * CH4  原始 GyroZ * 10，单位 0.1 度/秒
+         * CH5  GyroZ 零偏 * 10，单位 0.1 度/秒
+         * CH6  MPU ready，1=初始化成功
+         * CH7  MPU 错误码：0=正常，1=NACK，2=ID错误，3=参数错误，0xE1=运行中读失败，0xE2=校准样本不足
+         * CH8  WHO_AM_I 十进制读数：正常应为 104，也就是 0x68；255 常见于无通信；0 常见于总线被拉低
+         * CH9  MPU calibrated，1=已经完成零偏校准
+         * CH10 MPU 初始化尝试次数
+         */
+        Serial_Printf("[p,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d]\r\n",
+                      modeCode,
+                      (int)(g_yawDeg * 10.0f),
+                      (int)(g_gyroZDps * 10.0f),
+                      (int)(g_gyroZRawDps * 10.0f),
+                      (int)(g_gyroZBiasDps * 10.0f),
+                      (int)g_mpuReady,
+                      (int)g_mpuErr,
+                      (int)g_mpuWhoAmI,
+                      (int)g_mpuCalibrated,
+                      (int)g_mpuInitTryCount);
+        return;
+    }
+
     Serial_Printf("[p,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d]\r\n",
                   modeCode,
                   (int)g_lineError,
@@ -1329,6 +1596,16 @@ static void OLED_ShowStatus(void)
         OLED_Printf(0, 16, OLED_8X16, "Ld:%+04d Rd:%+04d", (int)g_leftSpeed, (int)g_rightSpeed);
         OLED_Printf(0, 32, OLED_8X16, "L:%+06ld", (long)g_leftEncoderTotal);
         OLED_Printf(0, 48, OLED_8X16, "R:%+06ld A:%+06ld", (long)g_rightEncoderTotal, (long)g_forwardEncoderTotal);
+        OLED_Update();
+        return;
+    }
+
+    if (g_plotMode == 2U)
+    {
+        OLED_Printf(0, 0, OLED_8X16, "R:%d E:%02X ID:%02X", (int)g_mpuReady, (int)g_mpuErr, (int)g_mpuWhoAmI);
+        OLED_Printf(0, 16, OLED_8X16, "C:%d N:%03d", (int)g_mpuCalibrated, (int)g_mpuInitTryCount);
+        OLED_Printf(0, 32, OLED_8X16, "Y:%+04d.%d", (int)g_yawDeg, (int)(absf_local(g_yawDeg * 10.0f)) % 10);
+        OLED_Printf(0, 48, OLED_8X16, "G:%+04d.%d B:%+03d", (int)g_gyroZDps, (int)(absf_local(g_gyroZDps * 10.0f)) % 10, (int)g_gyroZBiasDps);
         OLED_Update();
         return;
     }
@@ -1367,7 +1644,7 @@ static void Main_KeyProcess(void)
         }
 
         /*
-         * K2/SW2 改为编码器调试模式切换键：
+         * K2/SW2 为编码器调试模式切换键：
          *   开机默认 g_plotMode=0，即普通 BT 显示/回传模式；
          *   第一次按 K2：切换到编码器调试显示/回传模式，并清零累计脉冲；
          *   再按一次 K2：返回普通 BT 显示/回传模式。
@@ -1403,7 +1680,7 @@ static void Main_KeyProcess(void)
 }
 
 /* ================================================================
- * 12. 主函数和 1ms 定时中断
+ * 13. 主函数和 1ms 定时中断
  * ================================================================ */
 
 int main(void)
@@ -1417,6 +1694,9 @@ int main(void)
     /* 先强制配置灰度接口，再初始化 PB1/PB5 声光提示输出。 */
     Line_GPIOForceInit();
     PromptIO_Init();
+
+    /* OLED 已经初始化，PB8/PB9 总线可用，此时初始化 MPU6050。 */
+    MPU_AppInit();
 
     Serial_Init();
     Timer_Init();
@@ -1435,6 +1715,16 @@ int main(void)
     {
         Main_BTProcess();
         Main_KeyProcess();
+
+        if (g_mpuUpdateMs >= MPU_UPDATE_PERIOD_MS)
+        {
+            uint16_t elapsedMs;
+
+            elapsedMs = g_mpuUpdateMs;
+            g_mpuUpdateMs = 0;
+
+            MPU_UpdateYaw(elapsedMs);
+        }
 
         if (g_plotReportMs >= PLOT_REPORT_PERIOD_MS)
         {
@@ -1473,6 +1763,10 @@ void TIM1_UP_IRQHandler(void)
         if (g_plotReportMs < 60000U)
         {
             g_plotReportMs++;
+        }
+        if (g_mpuUpdateMs < 60000U)
+        {
+            g_mpuUpdateMs++;
         }
 
         controlDiv++;
