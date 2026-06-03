@@ -1,7 +1,8 @@
 /*
  * 文件：User/main.c
  * 版本：蓝牙遥控 + 八路灰度循迹 + presetFast + PB1/PB5 声光提示
- *       + 编码器累计调试 + MPU6050 yaw 调试 + straight 直线航向保持测试版。
+ *       + 编码器累计调试 + MPU6050 yaw 调试 + straight 直线航向保持测试
+ *       + task1 最小状态机版。
  *
  * 本版说明：
  *   1. 不再使用 PC13 板载 LED。
@@ -11,8 +12,10 @@
  *   5. 保留编码器累计调试模式，用于 100 cm 距离标定。
  *   6. 新增 MPU6050 yaw 调试模式，用于 GyroZ 零偏校准、yaw 积分和网页/OLED 回传。
  *   7. 保留 MPU6050 诊断信息：错误码、WHO_AM_I 读数、初始化尝试次数。
- *   8. 新增 [key,straight,down] 直线航向保持测试。
- *   9. 开机默认普通 BT 模式，按下 K2/SW2 后切换到编码器调试模式；
+ *   8. 保留 [key,straight,down] 直线航向保持测试。
+ *   9. 新增 [key,task1,down] 选择 H 题任务 1，[key,start,down] 开始执行。
+ *   10. task1 第一版只做 A -> B 直线 100 cm，到 B 停车并声光提示。
+ *   11. 开机默认普通 BT 模式，按下 K2/SW2 后切换到编码器调试模式；
  *      再按一次 K2/SW2 返回普通 BT 显示模式。
  *
  * 保留功能：
@@ -28,6 +31,7 @@
  *   10. K3/SW3 加载高速稳定参数 v1。
  *   11. K4/SW4 清零编码器累计脉冲。
  *   12. [key,straight,down] 使用编码器距离 + MPU6050 yaw 保持直线并自动停车。
+ *   13. [key,task1,down] + [key,start,down] 执行 H 题 task1：A -> B 停车。
  */
 
 #include "stm32f10x.h"
@@ -65,6 +69,12 @@
 /* 直线距离标定结果：100cm 约 7030 个左右平均编码器脉冲。 */
 #define ENCODER_PULSE_PER_CM           70.30f
 #define STRAIGHT_DISTANCE_DEFAULT      7030.0f
+
+/* straightSpeed = 15 时实测停车惯性补偿约 170 脉冲。
+ * task1 中使用 7030 - 170 = 6860 作为停止判断阈值，
+ * 实车测试实际停车约 99.7 cm。
+ */
+#define STRAIGHT_STOP_OFFSET_DEFAULT   170.0f
 
 /* ================================================================
  * 2. 八路灰度循迹默认参数
@@ -128,6 +138,15 @@ typedef enum
     WORK_BT = 0,
     WORK_TRACING = 1
 } WorkMode_t;
+
+typedef enum
+{
+    TASK_IDLE = 0,
+    TASK_READY_TASK1,
+    TASK_STRAIGHT_AB,
+    TASK_STOP_AT_B,
+    TASK_FINISH
+} TaskState_t;
 
 volatile WorkMode_t g_workMode = WORK_BT;
 
@@ -214,6 +233,18 @@ volatile float g_straightTargetYaw = 0.0f;
 volatile float g_straightYawError = 0.0f;
 volatile float g_yawKp = 1.8f;
 volatile float g_yawKd = 0.15f;
+
+/* H 题 task1 最小状态机参数。
+ * task1 目标是 A -> B 直线 100 cm，到 B 停车并声光提示。
+ * g_task1DistancePulse 表示真实目标距离脉冲，默认 7030。
+ * g_taskStopOffsetPulse 表示提前停车补偿，默认 170。
+ * 实际给 straight 控制使用的停止阈值为：7030 - 170 = 6860。
+ */
+volatile TaskState_t g_taskState = TASK_IDLE;
+volatile uint8_t g_taskSelected = 0;
+volatile uint8_t g_taskRunning = 0;
+volatile float g_task1DistancePulse = STRAIGHT_DISTANCE_DEFAULT;
+volatile float g_taskStopOffsetPulse = STRAIGHT_STOP_OFFSET_DEFAULT;
 
 /* ================================================================
  * 5. 小工具函数
@@ -752,7 +783,19 @@ static void Straight_Finish(void)
     g_straightDone = 1;
     Control_ForcePWMZero();
     g_plotMode = 3U;
-    Prompt_Start(500);
+
+    if (g_taskState == TASK_STRAIGHT_AB)
+    {
+        g_taskState = TASK_STOP_AT_B;
+        g_taskRunning = 0;
+        /* task1 到达 B 点，停车声光提示时间稍长一点，方便观察。 */
+        Prompt_Start(800);
+        g_taskState = TASK_FINISH;
+    }
+    else
+    {
+        Prompt_Start(500);
+    }
 }
 
 static void Straight_Control10ms(void)
@@ -785,6 +828,81 @@ static void Straight_Control10ms(void)
     g_lastCmdTickMs = 0;
 }
 
+
+/* ================================================================
+ * 10. H 题 task1 最小状态机
+ * ================================================================ */
+
+static void Task_Reset(void)
+{
+    g_taskState = TASK_IDLE;
+    g_taskSelected = 0;
+    g_taskRunning = 0;
+}
+
+static void Task_SelectTask1(void)
+{
+    if (g_safetyLocked)
+    {
+        Prompt_Start(80);
+        return;
+    }
+
+    g_taskSelected = 1;
+    g_taskRunning = 0;
+    g_taskState = TASK_READY_TASK1;
+    g_workMode = WORK_BT;
+    g_plotMode = 3U;
+    Control_ForcePWMZero();
+    Prompt_Start(220);
+}
+
+static void Task_StartSelected(void)
+{
+    float stopThreshold;
+
+    if (g_safetyLocked)
+    {
+        Prompt_Start(80);
+        return;
+    }
+
+    if (g_taskState != TASK_READY_TASK1 || g_taskSelected != 1U)
+    {
+        Prompt_Start(120);
+        return;
+    }
+
+    /* task1 复用已经验证过的 straight 直线控制。网页上保留真实距离 7030，
+     * 程序内部减去停车补偿 170，实际停止点接近 100 cm。
+     */
+    stopThreshold = g_task1DistancePulse - g_taskStopOffsetPulse;
+    if (stopThreshold < 0.0f)
+    {
+        stopThreshold = 0.0f;
+    }
+
+    g_straightDistancePulse = stopThreshold;
+    g_taskRunning = 1;
+    g_taskState = TASK_STRAIGHT_AB;
+    Straight_Start();
+
+    if (!g_straightActive)
+    {
+        g_taskRunning = 0;
+        g_taskState = TASK_READY_TASK1;
+    }
+}
+
+static void Task_Stop(void)
+{
+    g_straightActive = 0;
+    g_taskRunning = 0;
+    g_taskState = TASK_IDLE;
+    Control_ForcePWMZero();
+    Prompt_Start(300);
+}
+
 /* ================================================================
  * 10. 模式切换和安全锁定
  * ================================================================ */
@@ -793,6 +911,8 @@ void App_EmergencyStop(void)
 {
     g_safetyLocked = 1;
     g_workMode = WORK_BT;
+    g_straightActive = 0;
+    Task_Reset();
     Control_ForcePWMZero();
     Prompt_Start(500);
 }
@@ -801,6 +921,8 @@ void App_UnlockControl(void)
 {
     g_safetyLocked = 0;
     g_workMode = WORK_BT;
+    g_straightActive = 0;
+    Task_Reset();
     g_lastCmdTickMs = 0;
     Control_ForcePWMZero();
     Prompt_Start(180);
@@ -814,6 +936,8 @@ void App_StartBluetoothMode(void)
     }
 
     g_workMode = WORK_BT;
+    g_straightActive = 0;
+    Task_Reset();
     g_lastCmdTickMs = 0;
     Control_ForcePWMZero();
     Prompt_Start(160);
@@ -827,6 +951,7 @@ void App_StartTracingMode(void)
     }
 
     g_straightActive = 0;
+    Task_Reset();
     g_workMode = WORK_TRACING;
     g_lineLostMs = 0;
     g_lineErrorFiltered = 0.0f;
@@ -1079,6 +1204,21 @@ static void Main_ApplySliderPacket(const char *name, float value)
         g_straightDistancePulse = limit_float(value, 0.0f, 300.0f) * ENCODER_PULSE_PER_CM;
         return;
     }
+    if (str_is_name(name, "task1Distance", "task1Pulse", "abDistance"))
+    {
+        g_task1DistancePulse = limit_float(value, 0.0f, 30000.0f);
+        return;
+    }
+    if (str_is_name(name, "task1Cm", "abCm", "taskCm"))
+    {
+        g_task1DistancePulse = limit_float(value, 0.0f, 300.0f) * ENCODER_PULSE_PER_CM;
+        return;
+    }
+    if (str_is_name(name, "stopOffset", "straightOffset", "brakeOffset"))
+    {
+        g_taskStopOffsetPulse = limit_float(value, 0.0f, 2000.0f);
+        return;
+    }
 }
 
 static void Main_ApplyJoystickPacket(char **tok, int n)
@@ -1184,8 +1324,24 @@ static void Main_ApplyPacket(char *payload)
                 Prompt_Start(180);
                 return;
             }
+            if (str_is_name(tok[1], "task1", "selectTask1", "t1"))
+            {
+                Task_SelectTask1();
+                return;
+            }
+            if (str_is_name(tok[1], "start", "run", "taskStart"))
+            {
+                Task_StartSelected();
+                return;
+            }
+            if (str_is_name(tok[1], "taskStop", "taskReset", "taskIdle"))
+            {
+                Task_Stop();
+                return;
+            }
             if (str_is_name(tok[1], "straight", "straightTest", "goStraight"))
             {
+                Task_Reset();
                 Straight_Start();
                 return;
             }
@@ -1662,7 +1818,7 @@ static void Serial_SendPlotStatus(void)
 {
     int modeCode;
 
-    modeCode = g_safetyLocked ? 9 : (g_straightActive ? 3 : (int)g_workMode);
+    modeCode = g_safetyLocked ? 9 : (g_straightActive ? 3 : ((g_taskState == TASK_READY_TASK1) ? 11 : ((g_taskState == TASK_FINISH) ? 12 : (int)g_workMode)));
 
     if (g_plotMode == 1U)
     {
@@ -1733,7 +1889,7 @@ static void Serial_SendPlotStatus(void)
          * CH5  目标前进速度
          * CH6  目标转向速度
          * CH7  当前平均累计脉冲
-         * CH8  目标距离脉冲
+         * CH8  停止判断阈值脉冲
          * CH9  左 PWM
          * CH10 右 PWM
          */
@@ -1788,7 +1944,7 @@ static void OLED_ShowStatus(void)
 
     if (g_plotMode == 3U)
     {
-        OLED_Printf(0, 0, OLED_8X16, "STR RP:%03d %c", (int)g_btSpeedLimitPercent, g_straightActive ? 'R' : 'S');
+        OLED_Printf(0, 0, OLED_8X16, "STR T:%d RP:%03d", (int)g_taskState, (int)g_btSpeedLimitPercent);
         OLED_Printf(0, 16, OLED_8X16, "D:%+05ld/%05ld", (long)g_forwardEncoderTotal, (long)g_straightDistancePulse);
         OLED_Printf(0, 32, OLED_8X16, "Y:%+03d E:%+03d", (int)g_yawDeg, (int)g_straightYawError);
         OLED_Printf(0, 48, OLED_8X16, "T:%+03d P:%+04d", (int)g_targetTurnSpeed, (int)g_forwardSpeed);
@@ -1816,6 +1972,8 @@ static void Main_KeyProcess(void)
     if (key == 1U)
     {
         ApplySpeedLimitPercent(0.0f);
+        g_straightActive = 0;
+        Task_Reset();
         Control_ForcePWMZero();
         Prompt_Start(160);
         return;
@@ -1823,9 +1981,9 @@ static void Main_KeyProcess(void)
 
     if (key == 2U)
     {
-        if (g_straightActive)
+        if (g_straightActive || g_taskRunning)
         {
-            Straight_Finish();
+            Task_Stop();
             return;
         }
 
