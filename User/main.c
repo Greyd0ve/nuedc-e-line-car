@@ -1,41 +1,63 @@
 /*
  * 文件：User/main.c
- * 版本：蓝牙遥控 + 八路灰度循迹 + presetFast + PB1/PB5 声光提示
- *       + 编码器累计调试 + MPU6050 yaw 调试 + straight 直线航向保持测试
- *       + task1/task2 状态机版 + arcTest 半圆弧结束判断测试版。
+ * 版本：task2_encoder_v2_local_keys
  *
- * 本版说明：
- *   1. 不再使用 PC13 板载 LED。
- *   2. PB1 用作 BEEP 蜂鸣器输出，蜂鸣器为低电平触发。
- *   3. PB5 用作 LED_EXT 外接提示灯输出，LED 为高电平点亮。
- *   4. Prompt_Start()/Prompt_Tick1ms() 只控制 PB1 和 PB5。
- *   5. 保留编码器累计调试模式，用于 100 cm 距离标定。
- *   6. 新增 MPU6050 yaw 调试模式，用于 GyroZ 零偏校准、yaw 积分和网页/OLED 回传。
- *   7. 保留 MPU6050 诊断信息：错误码、WHO_AM_I 读数、初始化尝试次数。
- *   8. 保留 [key,straight,down] 直线航向保持测试。
- *   9. 新增 [key,task1,down] 选择 H 题任务 1，[key,start,down] 开始执行。
- *   10. task1 第一版只做 A -> B 直线 100 cm，到 B 停车并声光提示。
- *   11. 新增 [key,task2,down] + [key,start,down] 执行 A->B->C->D->A 一圈。
- *   12. 保留 [key,arcTest,down] 半圆弧结束判断测试。
- *   12. 开机默认普通 BT 模式，按下 K2/SW2 后切换到编码器调试模式；
- *      再按一次 K2/SW2 返回普通 BT 显示模式。
+ * 适用硬件：
+ *   STM32F103C8T6 小车训练板，标准外设库风格代码。
  *
- * 保留功能：
- *   1. 上电默认进入蓝牙遥控模式。
- *   2. 网页发送 [key,tracing,down] 进入八路灰度循迹模式。
- *   3. 网页发送 [key,Bluetooth,down] 返回蓝牙遥控模式。
- *   4. 网页发送 [key,emergency,down] 立即清零 PWM 并进入急停锁定。
- *   5. 网页发送 [key,unlock,down] 解除急停锁定。
- *   6. 网页发送 [slider,RP,0~100] 控制最大 PWM 百分比。
- *   7. K1/SW1 将 RP 设为 0%，PWM 清零，但不进入急停锁定。
- *   8. K2/SW2 在普通 BT 显示模式和编码器调试显示模式之间切换。
- *   9. 网页发送 [key,presetFast,down] 加载高速稳定参数 v1。
- *   10. K3/SW3 加载高速稳定参数 v1。
- *   11. K4/SW4 清零编码器累计脉冲。
- *   12. [key,straight,down] 使用编码器距离 + MPU6050 yaw 保持直线并自动停车。
- *   13. [key,task1,down] + [key,start,down] 执行 H 题 task1：A -> B 停车。
- *   14. [key,task2,down] + [key,start,down] 执行 H 题 task2：A->B->C->D->A。
- *   15. [key,arcTest,down] 从半圆弧起点开始循迹，并用 yaw 角度判断半圆结束。
+ * 本版改动重点：
+ *   1. 修正实体按键真实 PCB 映射：K1=PB10，K2=PB11，K3=PA11，K4=PA12。
+ *      Key.c 需要同步修改，否则 main.c 的按键含义会错位。
+ *   2. 上电默认进入本地待机状态，不再自动进入蓝牙遥控模式；PWM 清零，小车不运动。
+ *   3. 蓝牙遥控模式保留，但只允许通过网页命令 [key,Bluetooth,down] 进入。
+ *   4. 实体按键作为本地操作面板：
+ *      K1：待机 -> 编码器调试 -> MPU 调试 -> 待机 循环切换。
+ *      K2：task1 -> task2 -> task3 -> task4 循环选择任务，只选择不启动。
+ *      K3：待机状态执行当前任务；编码器调试清零脉冲；MPU 调试清零 yaw。
+ *      K4：解除急停/锁定，PWM 清零，回到待机。
+ *
+ * task2_encoder_v2 架构保持前一版思路：
+ *   A->B / C->D：MPU yaw 航向保持 + 左右轮平均脉冲判断距离。
+ *   直线到 6500 pulse 后提前进入 SEARCH_ARC，继续直行找半圆弧黑线，此时丢线正常。
+ *   看到黑线后进入 TRACE_ARC，使用八路灰度循迹跑半圆弧。
+ *   已经见线后连续丢线，认为离开半圆弧。
+ *   出弯后进入 ALIGN，用左右轮脉冲差补足到约 2850 pulse，再进入下一段直线。
+ *
+ * task2 状态顺序：
+ *   TASK2_STRAIGHT_AB     A -> B 直线，平均脉冲到 task2SearchPulse 后提前找线
+ *   TASK2_SEARCH_ARC_BC   继续直行，允许丢线，直到检测到 B->C 半圆弧黑线
+ *   TASK2_TRACE_ARC_BC    灰度循迹跑 B->C 半圆弧
+ *   TASK2_ALIGN_C         C 出弯后补角，直到左右轮脉冲差达到 arcWheelDiff
+ *   TASK2_STRAIGHT_CD     C -> D 直线，平均脉冲到 task2SearchPulse 后提前找线
+ *   TASK2_SEARCH_ARC_DA   继续直行，允许丢线，直到检测到 D->A 半圆弧黑线
+ *   TASK2_TRACE_ARC_DA    灰度循迹跑 D->A 半圆弧
+ *   TASK2_ALIGN_A         A 出弯后补角，到达 arcWheelDiff 后结束 task2
+ *   TASK2_FINISH          停车并声光提示
+ *
+ * 网页命令保留：
+ *   [key,Bluetooth,down]   进入蓝牙遥控模式
+ *   [key,tracing,down]     进入普通循迹模式
+ *   [key,emergency,down]   急停锁定
+ *   [key,unlock,down]      解除急停
+ *   [key,presetFast,down]  加载高速循迹参数
+ *   [key,encDebug,down]    编码器调试回传
+ *   [key,mpuDebug,down]    MPU 调试回传
+ *   [key,mpuCalib,down]    GyroZ 零偏校准
+ *   [key,yawZero,down]     yaw 清零
+ *   [key,task1/2,down]     网页选择任务
+ *   [key,start,down]       网页启动已选择任务
+ *   [key,taskStop,down]    中止任务并回待机
+ *
+ * task2 可调参数：
+ *   [slider,task2SearchPulse,6500]  直线提前找弧线阈值，单位 pulse
+ *   [slider,arcWheelDiff,2850]      半圆弧左右轮脉冲差目标，单位 pulse
+ *   [slider,arcMinPulse,6500]       弧线最小平均脉冲，防止中途误判丢线
+ *   [slider,arcFoundMs,80]          找到黑线确认时间，单位 ms
+ *   [slider,arcLostMs,0]            离开黑线确认时间，单位 ms；0 表示满足出弯条件后丢线立即补角
+ *   [slider,toArcSpeed,12]          SEARCH_ARC 直行找线速度
+ *   [slider,alignTurn,12]           出弯补角转向速度
+ *   [slider,bcTurnSign,-1]          B->C 补角方向符号
+ *   [slider,daTurnSign,1]           D->A 补角方向符号
  */
 
 #include "stm32f10x.h"
@@ -53,6 +75,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef GRAYSCALE_CHANNELS
+#define GRAYSCALE_CHANNELS 8U
+#endif
+
 /* ================================================================
  * 1. 基础控制周期和安全参数
  * ================================================================ */
@@ -66,25 +92,16 @@
 #define PWM_LIMIT_MIN                  0.0f
 #define PWM_LIMIT_MAX                  ((float)PWM_MAX_DUTY)
 
-/* MPU6050 静止校准参数：300 次，每次约 3ms，总时长约 0.9s。 */
+/* MPU6050 静止校准参数。当前先保持原方案，后续可再加长采样。 */
 #define MPU_CALIB_SAMPLES              300U
 #define MPU_CALIB_MIN_OK               240U
 
-/* 直线距离标定结果：100cm 约 7030 个左右平均编码器脉冲。 */
+/* 编码器距离标定结果：100 cm 约 7030 平均脉冲。 */
 #define ENCODER_PULSE_PER_CM           70.30f
 #define STRAIGHT_DISTANCE_DEFAULT      7030.0f
-
-/* straightSpeed = 15 时实测停车惯性补偿约 170 脉冲。
- * task1 中使用 7030 - 170 = 6860 作为停止判断阈值，
- * 实车测试实际停车约 99.7 cm。
- */
 #define STRAIGHT_STOP_OFFSET_DEFAULT   170.0f
 
-/* 半圆弧结束判断默认参数。
- * arcMinTime：最短运行时间，防止刚起步时误判。
- * arcYawTarget：半圆弧目标 yaw 变化角度，先用 165°，后续根据停车点微调。
- * arcMaxTime：安全超时，防止因丢线或 yaw 判断失败而一直跑。
- */
+/* arcTest 单独调试用的 yaw 结束参数，task2 新架构不再主要依赖该 yaw 值。 */
 #define ARC_MIN_TIME_DEFAULT_MS        1500U
 #define ARC_MAX_TIME_DEFAULT_MS        6000U
 #define ARC_YAW_TARGET_DEFAULT         165.0f
@@ -148,9 +165,22 @@ volatile float g_maxTurnCmd = 75.0f;
 
 typedef enum
 {
-    WORK_BT = 0,
-    WORK_TRACING = 1
+    /* 本地待机：上电默认状态，不响应摇杆遥控，PWM 保持清零。 */
+    WORK_STANDBY = 0,
+
+    /* 蓝牙遥控：只由网页 [key,Bluetooth,down] 进入。 */
+    WORK_BT = 1,
+
+    /* 普通八路灰度循迹：由网页 [key,tracing,down] 进入。 */
+    WORK_TRACING = 2
 } WorkMode_t;
+
+typedef enum
+{
+    LOCAL_STANDBY = 0,
+    LOCAL_ENCODER_DEBUG = 1,
+    LOCAL_MPU_DEBUG = 2
+} LocalMode_t;
 
 typedef enum
 {
@@ -160,14 +190,21 @@ typedef enum
     TASK_STRAIGHT_AB,
     TASK_STOP_AT_B,
     TASK_FINISH,
+
+    /* task2_encoder_v1 专用状态 */
     TASK2_STRAIGHT_AB,
-    TASK2_ARC_BC,
+    TASK2_SEARCH_ARC_BC,
+    TASK2_TRACE_ARC_BC,
+    TASK2_ALIGN_C,
     TASK2_STRAIGHT_CD,
-    TASK2_ARC_DA,
+    TASK2_SEARCH_ARC_DA,
+    TASK2_TRACE_ARC_DA,
+    TASK2_ALIGN_A,
     TASK2_FINISH
 } TaskState_t;
 
-volatile WorkMode_t g_workMode = WORK_BT;
+volatile WorkMode_t g_workMode = WORK_STANDBY;
+volatile LocalMode_t g_localMode = LOCAL_STANDBY;
 
 volatile float g_targetForwardSpeed = 0.0f;
 volatile float g_targetTurnSpeed = 0.0f;
@@ -185,20 +222,16 @@ volatile float g_rightSpeed = 0.0f;
 volatile float g_forwardSpeed = 0.0f;
 volatile float g_turnSpeed = 0.0f;
 
-/* 编码器距离调试累计值，在 Control_Run10ms() 中每 10ms 更新一次。 */
 volatile int32_t g_leftEncoderTotal = 0;
 volatile int32_t g_rightEncoderTotal = 0;
 volatile int32_t g_forwardEncoderTotal = 0;
 volatile int32_t g_turnEncoderTotal = 0;
 
-/* 0 = 普通网页回传，1 = 编码器调试回传，2 = MPU6050 yaw 调试回传，
- * 3 = straight 直线测试回传，4 = arcTest 半圆弧测试回传。
- */
+/* 0=普通回传，1=编码器调试，2=MPU调试，3=直线调试，4=弧线/task2调试 */
 volatile uint8_t g_plotMode = 0;
 
 volatile float g_speedPwm = 0.0f;
 volatile float g_diffPwm = 0.0f;
-
 volatile int16_t g_leftPwm = 0;
 volatile int16_t g_rightPwm = 0;
 volatile float g_forwardSpeedError = 0.0f;
@@ -227,15 +260,9 @@ volatile uint8_t g_mpuReady = 0;
 volatile uint8_t g_mpuErr = 0;
 volatile uint8_t g_mpuCalibrated = 0;
 volatile uint8_t g_mpuCalibrating = 0;
-
-/* MPU6050 诊断信息：
- *   g_mpuWhoAmI = WHO_AM_I 寄存器读数，正常应为 0x68。
- *   g_mpuInitTryCount = 调用 MPU_AppInit() 的次数，方便确认命令是否真的触发。
- */
 volatile uint8_t g_mpuWhoAmI = 0x00U;
 volatile uint8_t g_mpuInitTryCount = 0U;
 
-/* 如果实测逆时针旋转时 yaw 方向相反，可通过 [slider,yawSign,-1] 取反。 */
 volatile float g_mpuYawSign = 1.0f;
 volatile float g_gyroZRawDps = 0.0f;
 volatile float g_gyroZBiasDps = 0.0f;
@@ -243,23 +270,17 @@ volatile float g_gyroZDps = 0.0f;
 volatile float g_yawDeg = 0.0f;
 volatile float g_yawTotalDeg = 0.0f;
 
-/* straight 直线航向保持测试参数。
- * g_straightDistancePulse 使用编码器平均累计脉冲作为距离单位。
- */
+/* straight 直线航向保持参数。 */
 volatile uint8_t g_straightActive = 0;
 volatile uint8_t g_straightDone = 0;
-volatile float g_straightSpeed = 18.0f;
+volatile float g_straightSpeed = 15.0f;
 volatile float g_straightDistancePulse = STRAIGHT_DISTANCE_DEFAULT;
 volatile float g_straightTargetYaw = 0.0f;
 volatile float g_straightYawError = 0.0f;
 volatile float g_yawKp = 1.8f;
 volatile float g_yawKd = 0.15f;
 
-/* arcTest 半圆弧结束判断测试参数。
- * 从半圆弧起点放车，车头沿弧线切线方向，发送 [key,arcTest,down] 后开始灰度循迹。
- * 程序记录起始 yaw，并在运行时间超过 arcMinTime 后，
- * 当 abs(deltaYaw) 超过 arcYawTarget 时自动停车。
- */
+/* arcTest 单独测试参数。 */
 volatile uint8_t g_arcActive = 0;
 volatile uint8_t g_arcDone = 0;
 volatile uint16_t g_arcRunMs = 0;
@@ -269,22 +290,76 @@ volatile float g_arcYawTarget = ARC_YAW_TARGET_DEFAULT;
 volatile float g_arcStartYaw = 0.0f;
 volatile float g_arcDeltaYaw = 0.0f;
 
-/* H 题 task1/task2 状态机参数。
- * task1：A -> B 直线 100 cm，到 B 停车并声光提示。
- * task2：A -> B 直线，B -> C 半圆弧，C -> D 直线，D -> A 半圆弧，到 A 停车。
- * g_taskDistancePulse 表示直线真实目标距离脉冲，默认 7030。
- * g_taskStopOffsetPulse 表示提前停车补偿，默认 170。
- * 实际给 straight 控制使用的停止阈值为：7030 - 170 = 6860。
- */
+/* task1/task2 通用参数。 */
 volatile TaskState_t g_taskState = TASK_IDLE;
-volatile uint8_t g_taskSelected = 0;
+volatile uint8_t g_taskSelected = 1;
 volatile uint8_t g_taskRunning = 0;
 volatile float g_task1DistancePulse = STRAIGHT_DISTANCE_DEFAULT;
 volatile float g_task2DistancePulse = STRAIGHT_DISTANCE_DEFAULT;
 volatile float g_taskStopOffsetPulse = STRAIGHT_STOP_OFFSET_DEFAULT;
 
 /* ================================================================
- * 5. 小工具函数
+ * 5. task2_encoder_v1 新参数
+ * ================================================================ */
+
+/* A->B、C->D 提前进入 SEARCH_ARC 的平均脉冲阈值。
+ * 6500 pulse 约等于 92.5 cm，给相切接入半圆弧预留距离。
+ */
+volatile float g_task2StraightToSearchPulse = 6500.0f;
+
+/* 半圆弧理论左右轮脉冲差。
+ * 你的轮距初值约 B=(14.7+11.1)/2=12.9 cm，pulsePerCm=70.30：
+ * diff = 12.9*pi*70.30 ≈ 2850 pulse。
+ */
+volatile float g_task2ArcWheelDiffTarget = 2850.0f;
+
+/* 弧线阶段平均脉冲下限。只有走过足够长的弧线后，丢线才允许判定为出弯。 */
+volatile float g_task2ArcMinForwardPulse = 6500.0f;
+
+/* 进入弧线前，lineValid 连续有效的确认时间。 */
+volatile uint16_t g_task2LineFoundConfirmMs = 80U;
+
+/* 离开弧线时，lineValid 连续无效的确认时间。 */
+volatile uint16_t g_task2LineLostConfirmMs = 0U;
+
+/* SEARCH_ARC 阶段：继续按直线 yaw 低速前进找半圆弧黑线。 */
+volatile float g_task2SearchSpeed = 12.0f;
+
+/* ALIGN 阶段：补足左右轮脉冲差时的目标转向速度。 */
+volatile float g_task2AlignTurnSpeed = 12.0f;
+
+/* SEARCH_ARC 安全保护：提前找线后，如果又走了这么多脉冲还没找到线，则停车。 */
+volatile float g_task2SearchMaxPulse = 1800.0f;
+
+/* B->C 通常是右转，按当前编码器符号预计“右轮-左轮”为负。
+ * D->A 通常是左转，预计“右轮-左轮”为正。
+ * 如果实测补角方向反了，调 bcTurnSign/daTurnSign 即可。
+ */
+volatile float g_task2BcTurnSign = -1.0f;
+volatile float g_task2DaTurnSign = 1.0f;
+
+volatile uint16_t g_task2LineValidMs = 0;
+volatile uint16_t g_task2LineLostMs = 0;
+volatile float g_task2SearchStartPulse = 0.0f;
+volatile float g_task2CurrentTurnSign = -1.0f;
+
+/* ================================================================
+ * 6. 前向声明
+ * ================================================================ */
+
+static void Line_Update(void);
+static void Tracing_Control10ms(void);
+static void Task2_SearchArcStart(float turnSign);
+static uint8_t Task2_IsSpecialState(void);
+static void Task2_Control10ms(void);
+static void Task_Stop(void);
+static void Local_EnterStandby(void);
+static void Local_CycleMode(void);
+static void Local_SelectNextTask(void);
+static void Local_ExecuteSelectedTask(void);
+
+/* ================================================================
+ * 7. 小工具函数
  * ================================================================ */
 
 static float absf_local(float x)
@@ -292,59 +367,37 @@ static float absf_local(float x)
     return (x >= 0.0f) ? x : -x;
 }
 
+static int32_t abs_i32_local(int32_t x)
+{
+    return (x >= 0) ? x : -x;
+}
+
 static float limit_float(float value, float minVal, float maxVal)
 {
-    if (value < minVal)
-    {
-        return minVal;
-    }
-    if (value > maxVal)
-    {
-        return maxVal;
-    }
+    if (value < minVal) return minVal;
+    if (value > maxVal) return maxVal;
     return value;
 }
 
 static int16_t limit_i16(int32_t value, int16_t minVal, int16_t maxVal)
 {
-    if (value < minVal)
-    {
-        return minVal;
-    }
-    if (value > maxVal)
-    {
-        return maxVal;
-    }
+    if (value < minVal) return minVal;
+    if (value > maxVal) return maxVal;
     return (int16_t)value;
 }
 
 static float slew_float(float current, float target, float maxStep)
 {
-    if (maxStep <= 0.0f)
-    {
-        return target;
-    }
-    if (target > current + maxStep)
-    {
-        return current + maxStep;
-    }
-    if (target < current - maxStep)
-    {
-        return current - maxStep;
-    }
+    if (maxStep <= 0.0f) return target;
+    if (target > current + maxStep) return current + maxStep;
+    if (target < current - maxStep) return current - maxStep;
     return target;
 }
 
 static float wrap_180(float angle)
 {
-    while (angle > 180.0f)
-    {
-        angle -= 360.0f;
-    }
-    while (angle < -180.0f)
-    {
-        angle += 360.0f;
-    }
+    while (angle > 180.0f) angle -= 360.0f;
+    while (angle < -180.0f) angle += 360.0f;
     return angle;
 }
 
@@ -352,7 +405,6 @@ static void Main_DelayMs(uint16_t ms)
 {
     uint16_t i;
     volatile uint16_t j;
-
     for (i = 0; i < ms; i++)
     {
         for (j = 0; j < 7200U; j++)
@@ -364,10 +416,7 @@ static void Main_DelayMs(uint16_t ms)
 
 static char ascii_lower_char(char c)
 {
-    if (c >= 'A' && c <= 'Z')
-    {
-        return (char)(c + ('a' - 'A'));
-    }
+    if (c >= 'A' && c <= 'Z') return (char)(c + ('a' - 'A'));
     return c;
 }
 
@@ -375,10 +424,7 @@ static int str_equal_ignore_case(const char *a, const char *b)
 {
     while (*a != '\0' && *b != '\0')
     {
-        if (ascii_lower_char(*a) != ascii_lower_char(*b))
-        {
-            return 0;
-        }
+        if (ascii_lower_char(*a) != ascii_lower_char(*b)) return 0;
         a++;
         b++;
     }
@@ -392,23 +438,14 @@ static int str_is_down(const char *s)
 
 static int str_is_name(const char *s, const char *a, const char *b, const char *c)
 {
-    if (str_equal_ignore_case(s, a))
-    {
-        return 1;
-    }
-    if (b && str_equal_ignore_case(s, b))
-    {
-        return 1;
-    }
-    if (c && str_equal_ignore_case(s, c))
-    {
-        return 1;
-    }
+    if (str_equal_ignore_case(s, a)) return 1;
+    if (b && str_equal_ignore_case(s, b)) return 1;
+    if (c && str_equal_ignore_case(s, c)) return 1;
     return 0;
 }
 
 /* ================================================================
- * 6. PB1 蜂鸣器与 PB5 外接 LED 声光提示输出
+ * 8. PB1 蜂鸣器与 PB5 外接 LED 声光提示
  * ================================================================ */
 
 #define PROMPT_BEEP_PORT       GPIOB
@@ -416,50 +453,21 @@ static int str_is_name(const char *s, const char *a, const char *b, const char *
 #define PROMPT_LED_PORT        GPIOB
 #define PROMPT_LED_PIN         GPIO_Pin_5
 
-static void PromptIO_BeepOn(void)
-{
-    /* 蜂鸣器为低电平触发：PB1 = 0 时响。 */
-    GPIO_ResetBits(PROMPT_BEEP_PORT, PROMPT_BEEP_PIN);
-}
-
-static void PromptIO_BeepOff(void)
-{
-    GPIO_SetBits(PROMPT_BEEP_PORT, PROMPT_BEEP_PIN);
-}
+static void PromptIO_BeepOn(void)  { GPIO_ResetBits(PROMPT_BEEP_PORT, PROMPT_BEEP_PIN); }
+static void PromptIO_BeepOff(void) { GPIO_SetBits(PROMPT_BEEP_PORT, PROMPT_BEEP_PIN); }
+static void PromptIO_LedOn(void)   { GPIO_SetBits(PROMPT_LED_PORT, PROMPT_LED_PIN); }
+static void PromptIO_LedOff(void)  { GPIO_ResetBits(PROMPT_LED_PORT, PROMPT_LED_PIN); }
 
 static void PromptIO_BeepTurn(void)
 {
-    if (GPIO_ReadOutputDataBit(PROMPT_BEEP_PORT, PROMPT_BEEP_PIN))
-    {
-        PromptIO_BeepOn();
-    }
-    else
-    {
-        PromptIO_BeepOff();
-    }
-}
-
-static void PromptIO_LedOn(void)
-{
-    /* 外接 LED 为高电平点亮：PB5 = 1 时亮。 */
-    GPIO_SetBits(PROMPT_LED_PORT, PROMPT_LED_PIN);
-}
-
-static void PromptIO_LedOff(void)
-{
-    GPIO_ResetBits(PROMPT_LED_PORT, PROMPT_LED_PIN);
+    if (GPIO_ReadOutputDataBit(PROMPT_BEEP_PORT, PROMPT_BEEP_PIN)) PromptIO_BeepOn();
+    else PromptIO_BeepOff();
 }
 
 static void PromptIO_LedTurn(void)
 {
-    if (GPIO_ReadOutputDataBit(PROMPT_LED_PORT, PROMPT_LED_PIN))
-    {
-        PromptIO_LedOff();
-    }
-    else
-    {
-        PromptIO_LedOn();
-    }
+    if (GPIO_ReadOutputDataBit(PROMPT_LED_PORT, PROMPT_LED_PIN)) PromptIO_LedOff();
+    else PromptIO_LedOn();
 }
 
 static void PromptIO_AllOn(void)
@@ -483,19 +491,16 @@ static void PromptIO_AllTurn(void)
 static void PromptIO_Init(void)
 {
     GPIO_InitTypeDef GPIO_InitStructure;
-
     RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOB, ENABLE);
-
     GPIO_InitStructure.GPIO_Mode = GPIO_Mode_Out_PP;
     GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
     GPIO_InitStructure.GPIO_Pin = PROMPT_BEEP_PIN | PROMPT_LED_PIN;
     GPIO_Init(GPIOB, &GPIO_InitStructure);
-
     PromptIO_AllOff();
 }
 
 /* ================================================================
- * 7. PID、停车控制、提示和编码器清零
+ * 9. PID、停车控制、编码器清零
  * ================================================================ */
 
 static void PID_Reset(PID_TypeDef *pid)
@@ -506,33 +511,23 @@ static void PID_Reset(PID_TypeDef *pid)
 
 static float PID_Calc(PID_TypeDef *pid, float target, float measure)
 {
-    float error;
-    float derivative;
-    float integralCandidate;
+    float error = target - measure;
+    float derivative = error - pid->LastError;
+    float integralCandidate = pid->Integral + error;
     float output;
 
-    error = target - measure;
-    derivative = error - pid->LastError;
-    integralCandidate = pid->Integral + error;
     integralCandidate = limit_float(integralCandidate, -pid->IntegralLimit, pid->IntegralLimit);
-
     output = pid->Kp * error + pid->Ki * integralCandidate + pid->Kd * derivative;
 
     if (output > pid->OutputLimit)
     {
         output = pid->OutputLimit;
-        if (error < 0.0f)
-        {
-            pid->Integral = integralCandidate;
-        }
+        if (error < 0.0f) pid->Integral = integralCandidate;
     }
     else if (output < -pid->OutputLimit)
     {
         output = -pid->OutputLimit;
-        if (error > 0.0f)
-        {
-            pid->Integral = integralCandidate;
-        }
+        if (error > 0.0f) pid->Integral = integralCandidate;
     }
     else
     {
@@ -567,7 +562,6 @@ static void Control_UpdatePIDParam(void)
     ForwardPID.Kp = g_forwardKp;
     ForwardPID.Ki = g_forwardKi;
     ForwardPID.Kd = g_forwardKd;
-
     TurnPID.Kp = g_turnKp;
     TurnPID.Ki = g_turnKi;
     TurnPID.Kd = g_turnKd;
@@ -576,6 +570,7 @@ static void Control_UpdatePIDParam(void)
 static void Control_ForcePWMZero(void)
 {
     g_straightActive = 0;
+    g_arcActive = 0;
     g_targetForwardSpeed = 0.0f;
     g_targetTurnSpeed = 0.0f;
     g_speedPwm = 0.0f;
@@ -599,35 +594,35 @@ static void Prompt_Tick1ms(void)
     if (g_promptMs > 0)
     {
         g_promptMs--;
-        if ((g_promptMs % 80U) == 0U)
-        {
-            PromptIO_AllTurn();
-        }
-        if (g_promptMs == 0U)
-        {
-            PromptIO_AllOff();
-        }
+        if ((g_promptMs % 80U) == 0U) PromptIO_AllTurn();
+        if (g_promptMs == 0U) PromptIO_AllOff();
     }
 }
 
-static void Encoder_DebugClearTotals(void)
+static void Encoder_ClearTotalsOnly(void)
 {
     __disable_irq();
-
     g_leftEncoderTotal = 0;
     g_rightEncoderTotal = 0;
     g_forwardEncoderTotal = 0;
     g_turnEncoderTotal = 0;
-
     Encoder_ClearAll();
-
     __enable_irq();
+}
 
+static void Encoder_DebugClearTotals(void)
+{
+    Encoder_ClearTotalsOnly();
     Prompt_Start(180);
 }
 
+static int32_t Task2_GetWheelDiffPulse(void)
+{
+    return g_rightEncoderTotal - g_leftEncoderTotal;
+}
+
 /* ================================================================
- * 8. MPU6050 yaw 读取、积分和零偏校准
+ * 10. MPU6050 yaw 读取、积分和零偏校准
  * ================================================================ */
 
 static void MPU_ResetYaw(void)
@@ -638,22 +633,11 @@ static void MPU_ResetYaw(void)
 
 static void MPU_AppInit(void)
 {
-    /*
-     * 诊断流程：
-     *   1. 先初始化 PB8/PB9 软件 I2C 总线；
-     *   2. 直接读取 WHO_AM_I，正常 MPU6050 应返回 0x68；
-     *   3. 再执行完整 MPU6050_Init()，配置采样率、滤波和量程；
-     *   4. 将错误码、WHO_AM_I 和 ready 标志回传到网页/OLED。
-     */
-    if (g_mpuInitTryCount < 255U)
-    {
-        g_mpuInitTryCount++;
-    }
+    if (g_mpuInitTryCount < 255U) g_mpuInitTryCount++;
 
     MPU6050_InitBus();
     Main_DelayMs(20);
     g_mpuWhoAmI = MPU6050_GetID();
-
     g_mpuErr = MPU6050_Init();
 
     if (g_mpuErr == MPU6050_OK)
@@ -677,20 +661,9 @@ static void MPU_UpdateYaw(uint16_t elapsedMs)
     MPU6050_Data_t data;
     float dt;
 
-    if (!g_mpuReady || g_mpuCalibrating)
-    {
-        return;
-    }
-
-    if (elapsedMs == 0U)
-    {
-        return;
-    }
-
-    if (elapsedMs > 50U)
-    {
-        elapsedMs = 50U;
-    }
+    if (!g_mpuReady || g_mpuCalibrating) return;
+    if (elapsedMs == 0U) return;
+    if (elapsedMs > 50U) elapsedMs = 50U;
 
     if (MPU6050_ReadData(&data) != MPU6050_OK)
     {
@@ -700,7 +673,6 @@ static void MPU_UpdateYaw(uint16_t elapsedMs)
     }
 
     dt = (float)elapsedMs * 0.001f;
-
     g_gyroZRawDps = data.GyroZ_dps;
     g_gyroZDps = (data.GyroZ_dps - g_gyroZBiasDps) * g_mpuYawSign;
 
@@ -715,19 +687,16 @@ static void MPU_CalibrateGyroZ(void)
     uint16_t okCount;
     float sum;
 
-    /* 校准必须保持静止，并强制回到蓝牙模式停车，避免车在校准时运动。 */
     g_workMode = WORK_BT;
     Control_ForcePWMZero();
+    g_taskRunning = 0;
+    g_taskState = TASK_IDLE;
 
     g_mpuCalibrating = 1;
     g_mpuCalibrated = 0;
     Prompt_Start(600);
 
-    if (!g_mpuReady)
-    {
-        MPU_AppInit();
-    }
-
+    if (!g_mpuReady) MPU_AppInit();
     if (!g_mpuReady)
     {
         g_mpuCalibrating = 0;
@@ -736,7 +705,6 @@ static void MPU_CalibrateGyroZ(void)
 
     sum = 0.0f;
     okCount = 0;
-
     for (i = 0; i < MPU_CALIB_SAMPLES; i++)
     {
         if (MPU6050_ReadData(&data) == MPU6050_OK)
@@ -744,7 +712,6 @@ static void MPU_CalibrateGyroZ(void)
             sum += data.GyroZ_dps;
             okCount++;
         }
-
         Main_DelayMs(3);
     }
 
@@ -769,7 +736,7 @@ static void MPU_CalibrateGyroZ(void)
 }
 
 /* ================================================================
- * 9. straight 直线航向保持测试
+ * 11. straight 直线航向保持
  * ================================================================ */
 
 static void Straight_Start(void)
@@ -780,12 +747,8 @@ static void Straight_Start(void)
         return;
     }
 
-    if (!g_mpuReady)
-    {
-        MPU_AppInit();
-    }
+    if (!g_mpuReady) MPU_AppInit();
 
-    /* 直线航向保持依赖 yaw 零偏校准。未校准时不启动，避免小车跑偏。 */
     if (!g_mpuReady || !g_mpuCalibrated)
     {
         g_plotMode = 2U;
@@ -799,7 +762,7 @@ static void Straight_Start(void)
     g_straightDone = 0;
 
     Control_ForcePWMZero();
-    Encoder_DebugClearTotals();
+    Encoder_ClearTotalsOnly();
 
     g_straightTargetYaw = g_yawDeg;
     g_straightYawError = 0.0f;
@@ -811,8 +774,9 @@ static void Straight_Start(void)
 
     PID_Reset(&ForwardPID);
     PID_Reset(&TurnPID);
-    Prompt_Start(180);
+    Prompt_Start(120);
 }
+
 
 static float Task_GetStraightStopThreshold(float realDistancePulse)
 {
@@ -823,910 +787,85 @@ static float Task_GetStraightStopThreshold(float realDistancePulse)
     {
         stopThreshold = 0.0f;
     }
+
     return stopThreshold;
 }
 
-/* Straight_Finish() 中需要启动下一段半圆弧，因此提前声明 Arc_Start()。 */
-static void Arc_Start(void);
-
-static void Straight_Finish(void)
+static void Task2_ApplyYawStraightHold(float speed)
 {
-    g_straightActive = 0;
-    g_straightDone = 1;
-    Control_ForcePWMZero();
-    g_plotMode = 3U;
-
-    if (g_taskState == TASK_STRAIGHT_AB)
-    {
-        g_taskState = TASK_STOP_AT_B;
-        g_taskRunning = 0;
-        /* task1 到达 B 点，停车声光提示时间稍长一点，方便观察。 */
-        Prompt_Start(800);
-        g_taskState = TASK_FINISH;
-        return;
-    }
-
-    if (g_taskState == TASK2_STRAIGHT_AB)
-    {
-        /* task2 到达 B 点：声光短提示，然后进入 B->C 半圆弧循迹。 */
-        g_taskState = TASK2_ARC_BC;
-        Arc_Start();
-        Prompt_Start(250);
-        return;
-    }
-
-    if (g_taskState == TASK2_STRAIGHT_CD)
-    {
-        /* task2 到达 D 点：声光短提示，然后进入 D->A 半圆弧循迹。 */
-        g_taskState = TASK2_ARC_DA;
-        Arc_Start();
-        Prompt_Start(250);
-        return;
-    }
-
-    Prompt_Start(500);
-}
-
-static void Straight_Control10ms(void)
-{
-    float targetDistance;
     float turnCmd;
 
-    if (!g_straightActive)
-    {
-        return;
-    }
-
-    targetDistance = limit_float(g_straightDistancePulse, 0.0f, 30000.0f);
-
-    if ((float)g_forwardEncoderTotal >= targetDistance)
-    {
-        Straight_Finish();
-        return;
-    }
-
     g_straightYawError = wrap_180(g_straightTargetYaw - g_yawDeg);
-
-    /* 航向保持：偏航角误差负责拉回方向，GyroZ 项用于抑制摆动。 */
     turnCmd = g_yawKp * g_straightYawError - g_yawKd * g_gyroZDps;
     turnCmd = limit_float(turnCmd, -g_maxTurnCmd, g_maxTurnCmd);
 
-    g_targetForwardSpeed = slew_float(g_targetForwardSpeed, g_straightSpeed, g_forwardSlewStep);
+    g_targetForwardSpeed = slew_float(g_targetForwardSpeed, speed, g_forwardSlewStep);
     g_targetTurnSpeed = slew_float(g_targetTurnSpeed, turnCmd, g_turnSlewStep);
     g_carEnable = 1;
     g_lastCmdTickMs = 0;
 }
 
-/* ================================================================
- * 10. arcTest 半圆弧结束判断测试
- * ================================================================ */
-
-static void Arc_Finish(void)
+static void Straight_Finish(void)
 {
-    g_arcActive = 0;
-    g_arcDone = 1;
-    g_workMode = WORK_BT;
-    Control_ForcePWMZero();
-    g_plotMode = 4U;
+    g_straightActive = 0;
+    g_straightDone = 1;
 
-    if (g_taskState == TASK2_ARC_BC)
+    if (g_taskState == TASK_STRAIGHT_AB)
     {
-        /* task2 到达 C 点：进入 C->D 直线段。 */
-        g_taskState = TASK2_STRAIGHT_CD;
-        g_straightDistancePulse = Task_GetStraightStopThreshold(g_task2DistancePulse);
-        Straight_Start();
-        Prompt_Start(250);
-        return;
-    }
-
-    if (g_taskState == TASK2_ARC_DA)
-    {
-        /* task2 回到 A 点：整圈完成，停车并长声光提示。 */
-        g_taskRunning = 0;
-        g_taskState = TASK2_FINISH;
-        g_plotMode = 3U;
-        Prompt_Start(1000);
-        return;
-    }
-
-    Prompt_Start(700);
-}
-
-static void Arc_Start(void)
-{
-    if (g_safetyLocked)
-    {
-        Prompt_Start(80);
-        return;
-    }
-
-    if (!g_mpuReady)
-    {
-        MPU_AppInit();
-    }
-
-    /* 半圆弧结束判断依赖 yaw。未校准时不启动，先切到 MPU 页面提示。 */
-    if (!g_mpuReady || !g_mpuCalibrated)
-    {
-        g_plotMode = 2U;
         Control_ForcePWMZero();
-        Prompt_Start(900);
+        g_taskRunning = 0;
+        g_taskState = TASK_FINISH;
+        g_plotMode = 3U;
+        Prompt_Start(800);
         return;
     }
 
-    g_straightActive = 0;
-    g_arcDone = 0;
-    g_arcRunMs = 0;
-    g_arcStartYaw = g_yawDeg;
-    g_arcDeltaYaw = 0.0f;
+    if (g_taskState == TASK2_STRAIGHT_AB)
+    {
+        /* A->B 提前到 6500 pulse 后，不停车，进入 B->C 找线阶段。 */
+        g_taskState = TASK2_SEARCH_ARC_BC;
+        Task2_SearchArcStart(g_task2BcTurnSign);
+        Prompt_Start(120);
+        return;
+    }
 
-    g_workMode = WORK_TRACING;
-    g_plotMode = 4U;
-
-    g_lineLostMs = 0;
-    g_lineErrorFiltered = 0.0f;
-    g_lineLastCtrlError = 0.0f;
+    if (g_taskState == TASK2_STRAIGHT_CD)
+    {
+        /* C->D 提前到 6500 pulse 后，不停车，进入 D->A 找线阶段。 */
+        g_taskState = TASK2_SEARCH_ARC_DA;
+        Task2_SearchArcStart(g_task2DaTurnSign);
+        Prompt_Start(120);
+        return;
+    }
 
     Control_ForcePWMZero();
-    Encoder_DebugClearTotals();
-
-    g_targetForwardSpeed = 0.0f;
-    g_targetTurnSpeed = 0.0f;
-    g_carEnable = 1;
-    g_lastCmdTickMs = 0;
-    g_arcActive = 1;
-
-    PID_Reset(&ForwardPID);
-    PID_Reset(&TurnPID);
-    Prompt_Start(180);
-}
-
-/* 前向声明：Arc_Control10ms() 位于循迹函数定义之前，先声明避免 ARMCC 隐式声明错误。 */
-static void Tracing_Control10ms(void);
-
-static void Arc_Control10ms(void)
-{
-    float absDelta;
-
-    if (!g_arcActive)
-    {
-        return;
-    }
-
-    if (g_arcRunMs < 60000U - CONTROL_PERIOD_MS)
-    {
-        g_arcRunMs += CONTROL_PERIOD_MS;
-    }
-
-    g_arcDeltaYaw = wrap_180(g_yawDeg - g_arcStartYaw);
-    absDelta = absf_local(g_arcDeltaYaw);
-
-    /* 结束条件：
-     * 1. 至少运行 arcMinTime，避免刚起步误判；
-     * 2. yaw 变化角度达到 arcYawTarget，认为半圆弧结束；
-     * 3. arcMaxTime 是安全超时，防止一直跑。
-     */
-    if (((g_arcRunMs >= g_arcMinTimeMs) && (absDelta >= g_arcYawTarget)) ||
-        (g_arcRunMs >= g_arcMaxTimeMs))
-    {
-        Arc_Finish();
-        return;
-    }
-
-    Tracing_Control10ms();
-    g_lastCmdTickMs = 0;
-}
-
-
-/* ================================================================
- * 11. H 题 task1 最小状态机
- * ================================================================ */
-
-static void Task_Reset(void)
-{
-    g_taskState = TASK_IDLE;
-    g_taskSelected = 0;
-    g_taskRunning = 0;
-    g_straightActive = 0;
-    g_arcActive = 0;
-}
-
-static void Task_SelectTask1(void)
-{
-    if (g_safetyLocked)
-    {
-        Prompt_Start(80);
-        return;
-    }
-
-    g_taskSelected = 1;
-    g_taskRunning = 0;
-    g_taskState = TASK_READY_TASK1;
-    g_workMode = WORK_BT;
     g_plotMode = 3U;
-    Control_ForcePWMZero();
-    Prompt_Start(220);
-}
-
-static void Task_SelectTask2(void)
-{
-    if (g_safetyLocked)
-    {
-        Prompt_Start(80);
-        return;
-    }
-
-    g_taskSelected = 2;
-    g_taskRunning = 0;
-    g_taskState = TASK_READY_TASK2;
-    g_workMode = WORK_BT;
-    g_plotMode = 3U;
-    Control_ForcePWMZero();
-    Prompt_Start(260);
-}
-
-static void Task_StartSelected(void)
-{
-    if (g_safetyLocked)
-    {
-        Prompt_Start(80);
-        return;
-    }
-
-    if (g_taskSelected == 1U && g_taskState == TASK_READY_TASK1)
-    {
-        /* task1 复用已经验证过的 straight 直线控制。网页上保留真实距离 7030，
-         * 程序内部减去停车补偿 170，实际停止点接近 100 cm。
-         */
-        g_straightDistancePulse = Task_GetStraightStopThreshold(g_task1DistancePulse);
-        g_taskRunning = 1;
-        g_taskState = TASK_STRAIGHT_AB;
-        Straight_Start();
-
-        if (!g_straightActive)
-        {
-            g_taskRunning = 0;
-            g_taskState = TASK_READY_TASK1;
-        }
-        return;
-    }
-
-    if (g_taskSelected == 2U && g_taskState == TASK_READY_TASK2)
-    {
-        /* task2 第一段：A->B 直线。后续段由 Straight_Finish()/Arc_Finish() 自动切换。 */
-        g_straightDistancePulse = Task_GetStraightStopThreshold(g_task2DistancePulse);
-        g_taskRunning = 1;
-        g_taskState = TASK2_STRAIGHT_AB;
-        Straight_Start();
-
-        if (!g_straightActive)
-        {
-            g_taskRunning = 0;
-            g_taskState = TASK_READY_TASK2;
-        }
-        return;
-    }
-
-    Prompt_Start(120);
-}
-
-static void Task_Stop(void)
-{
-    g_straightActive = 0;
-    g_arcActive = 0;
-    g_taskRunning = 0;
-    g_taskState = TASK_IDLE;
-    g_workMode = WORK_BT;
-    Control_ForcePWMZero();
-    Prompt_Start(300);
-}
-
-/* ================================================================
- * 10. 模式切换和安全锁定
- * ================================================================ */
-
-void App_EmergencyStop(void)
-{
-    g_safetyLocked = 1;
-    g_workMode = WORK_BT;
-    g_straightActive = 0;
-    g_arcActive = 0;
-    Task_Reset();
-    Control_ForcePWMZero();
     Prompt_Start(500);
 }
 
-void App_UnlockControl(void)
+static void Straight_Control10ms(void)
 {
-    g_safetyLocked = 0;
-    g_workMode = WORK_BT;
-    g_straightActive = 0;
-    g_arcActive = 0;
-    Task_Reset();
-    g_lastCmdTickMs = 0;
-    Control_ForcePWMZero();
-    Prompt_Start(180);
-}
+    if (!g_straightActive) return;
 
-void App_StartBluetoothMode(void)
-{
-    if (g_safetyLocked)
+    if ((float)g_forwardEncoderTotal >= limit_float(g_straightDistancePulse, 0.0f, 30000.0f))
     {
+        Straight_Finish();
         return;
     }
 
-    g_workMode = WORK_BT;
-    g_straightActive = 0;
-    g_arcActive = 0;
-    Task_Reset();
-    g_lastCmdTickMs = 0;
-    Control_ForcePWMZero();
-    Prompt_Start(160);
-}
-
-void App_StartTracingMode(void)
-{
-    if (g_safetyLocked)
-    {
-        return;
-    }
-
-    g_straightActive = 0;
-    g_arcActive = 0;
-    Task_Reset();
-    g_workMode = WORK_TRACING;
-    g_lineLostMs = 0;
-    g_lineErrorFiltered = 0.0f;
-    g_lineLastCtrlError = 0.0f;
-    g_targetForwardSpeed = 0.0f;
-    g_targetTurnSpeed = 0.0f;
-    g_carEnable = 1;
-    g_lastCmdTickMs = 0;
-    Encoder_ClearAll();
-    PID_Reset(&ForwardPID);
-    PID_Reset(&TurnPID);
-    Prompt_Start(160);
+    Task2_ApplyYawStraightHold(g_straightSpeed);
 }
 
 /* ================================================================
- * 10. 蓝牙/网页数据包解析
- * ================================================================ */
-
-static void ApplySpeedLimitPercent(float percent)
-{
-    float ratio;
-
-    percent = limit_float(percent, 0.0f, 100.0f);
-    ratio = percent / 100.0f;
-
-    g_btSpeedLimitPercent = percent;
-    g_speedScale = ratio;
-    g_pwmLimit = PWM_LIMIT_MAX * ratio;
-}
-
-static void ApplyFastPreset(void)
-{
-    ApplySpeedLimitPercent(55.0f);
-
-    g_traceBaseSpeed = 60.0f;
-    g_lineKp = 0.350f;
-    g_lineKd = 0.600f;
-    g_lineTurnLimit = 180.0f;
-    g_lineMinTurn = 34.0f;
-    g_lineFilterAlpha = 0.58f;
-    g_lineSlowGain = 0.88f;
-    g_lineEdgeTurnExtra = 82.0f;
-    g_lineEdgeSpeedRatio = 0.24f;
-    g_forwardSlewStep = 14.0f;
-    g_turnSlewStep = 60.0f;
-    g_lineLostTurn = 130.0f;
-
-    g_lineTurnSign = 1.0f;
-    g_lineBlackLevelF = 1.0f;
-    g_lineReverseOrderF = 0.0f;
-
-    g_lineLostMs = 0;
-    g_lineErrorFiltered = 0.0f;
-    g_lineLastCtrlError = 0.0f;
-    PID_Reset(&ForwardPID);
-    PID_Reset(&TurnPID);
-    Prompt_Start(220);
-}
-
-static void Main_ApplySliderPacket(const char *name, float value)
-{
-    if (str_is_name(name, "RP", "rp", "speedLimit"))
-    {
-        ApplySpeedLimitPercent(value);
-        return;
-    }
-
-    if (str_is_name(name, "speedKp", "forwardKp", "fKp"))
-    {
-        g_forwardKp = limit_float(value, 0.0f, 80.0f);
-        return;
-    }
-    if (str_is_name(name, "speedKi", "forwardKi", "fKi"))
-    {
-        g_forwardKi = limit_float(value, 0.0f, 20.0f);
-        return;
-    }
-    if (str_is_name(name, "speedKd", "forwardKd", "fKd"))
-    {
-        g_forwardKd = limit_float(value, 0.0f, 30.0f);
-        return;
-    }
-
-    if (str_is_name(name, "turnKp", "diffKp", "tKp"))
-    {
-        g_turnKp = limit_float(value, 0.0f, 80.0f);
-        return;
-    }
-    if (str_is_name(name, "turnKi", "diffKi", "tKi"))
-    {
-        g_turnKi = limit_float(value, 0.0f, 20.0f);
-        return;
-    }
-    if (str_is_name(name, "turnKd", "diffKd", "tKd"))
-    {
-        g_turnKd = limit_float(value, 0.0f, 30.0f);
-        return;
-    }
-
-    if (str_is_name(name, "maxForward", "maxSpeed", "btSpeed"))
-    {
-        g_maxForwardCmd = limit_float(value, 0.0f, 200.0f);
-        return;
-    }
-    if (str_is_name(name, "maxTurn", "btTurn", "remoteTurn"))
-    {
-        g_maxTurnCmd = limit_float(value, 0.0f, 200.0f);
-        return;
-    }
-
-    if (str_is_name(name, "traceKp", "lineKp", "lineP"))
-    {
-        g_lineKp = limit_float(value, 0.0f, 1.0f);
-        return;
-    }
-    if (str_is_name(name, "traceKd", "lineKd", "lineD"))
-    {
-        g_lineKd = limit_float(value, 0.0f, 1.0f);
-        return;
-    }
-    if (str_is_name(name, "traceSpeed", "lineSpeed", "baseSpeed"))
-    {
-        g_traceBaseSpeed = limit_float(value, 0.0f, 120.0f);
-        return;
-    }
-    if (str_is_name(name, "searchSpeed", "lostSpeed", "findSpeed"))
-    {
-        g_traceSearchSpeed = limit_float(value, 0.0f, 80.0f);
-        return;
-    }
-    if (str_is_name(name, "turnLimit", "lineTurnLimit", "traceTurnLimit"))
-    {
-        g_lineTurnLimit = limit_float(value, 0.0f, 180.0f);
-        return;
-    }
-    if (str_is_name(name, "lostTurn", "lineLostTurn", "findTurn"))
-    {
-        g_lineLostTurn = limit_float(value, 0.0f, 180.0f);
-        return;
-    }
-    if (str_is_name(name, "filter", "lineFilter", "alpha"))
-    {
-        if (value > 1.0f)
-        {
-            value = value / 100.0f;
-        }
-        g_lineFilterAlpha = limit_float(value, 0.0f, 1.0f);
-        return;
-    }
-    if (str_is_name(name, "slowGain", "lineSlow", "curveSlow"))
-    {
-        if (value > 1.0f)
-        {
-            value = value / 100.0f;
-        }
-        g_lineSlowGain = limit_float(value, 0.0f, 0.95f);
-        return;
-    }
-    if (str_is_name(name, "edgeBoost", "edgeTurn", "edgeExtra"))
-    {
-        g_lineEdgeTurnExtra = limit_float(value, 0.0f, 100.0f);
-        return;
-    }
-    if (str_is_name(name, "edgeSlow", "edgeSpeed", "edgeRatio"))
-    {
-        if (value > 1.0f)
-        {
-            value = value / 100.0f;
-        }
-        g_lineEdgeSpeedRatio = limit_float(value, 0.05f, 1.0f);
-        return;
-    }
-    if (str_is_name(name, "minTurn", "lineMinTurn", "traceMinTurn"))
-    {
-        g_lineMinTurn = limit_float(value, 0.0f, 80.0f);
-        return;
-    }
-    if (str_is_name(name, "forwardSlew", "speedSlew", "fSlew"))
-    {
-        g_forwardSlewStep = limit_float(value, 0.0f, 30.0f);
-        return;
-    }
-    if (str_is_name(name, "turnSlew", "diffSlew", "tSlew"))
-    {
-        g_turnSlewStep = limit_float(value, 0.0f, 60.0f);
-        return;
-    }
-    if (str_is_name(name, "lineSign", "traceSign", "turnSign"))
-    {
-        g_lineTurnSign = (value < 0.0f) ? -1.0f : 1.0f;
-        return;
-    }
-    if (str_is_name(name, "blackLevel", "lineLevel", "black"))
-    {
-        g_lineBlackLevelF = (value <= 0.0f) ? 0.0f : 1.0f;
-        return;
-    }
-    if (str_is_name(name, "lineReverse", "reverseLine", "sensorReverse"))
-    {
-        g_lineReverseOrderF = (value <= 0.0f) ? 0.0f : 1.0f;
-        return;
-    }
-    if (str_is_name(name, "plotMode", "debugMode", "dbg"))
-    {
-        if (value < 0.5f)
-        {
-            g_plotMode = 0U;
-        }
-        else if (value < 1.5f)
-        {
-            g_plotMode = 1U;
-        }
-        else if (value < 2.5f)
-        {
-            g_plotMode = 2U;
-        }
-        else if (value < 3.5f)
-        {
-            g_plotMode = 3U;
-        }
-        else
-        {
-            g_plotMode = 4U;
-        }
-        return;
-    }
-    if (str_is_name(name, "yawSign", "gyroSign", "mpuSign"))
-    {
-        g_mpuYawSign = (value < 0.0f) ? -1.0f : 1.0f;
-        return;
-    }
-    if (str_is_name(name, "yawKp", "headingKp", "straightKp"))
-    {
-        g_yawKp = limit_float(value, 0.0f, 20.0f);
-        return;
-    }
-    if (str_is_name(name, "yawKd", "headingKd", "straightKd"))
-    {
-        g_yawKd = limit_float(value, 0.0f, 10.0f);
-        return;
-    }
-    if (str_is_name(name, "straightSpeed", "straightV", "lineV"))
-    {
-        g_straightSpeed = limit_float(value, 0.0f, 80.0f);
-        return;
-    }
-    if (str_is_name(name, "straightDistance", "straightPulse", "straightDist"))
-    {
-        g_straightDistancePulse = limit_float(value, 0.0f, 30000.0f);
-        return;
-    }
-    if (str_is_name(name, "straightCm", "distanceCm", "distCm"))
-    {
-        g_straightDistancePulse = limit_float(value, 0.0f, 300.0f) * ENCODER_PULSE_PER_CM;
-        return;
-    }
-    if (str_is_name(name, "task1Distance", "task1Pulse", "abDistance"))
-    {
-        g_task1DistancePulse = limit_float(value, 0.0f, 30000.0f);
-        return;
-    }
-    if (str_is_name(name, "task1Cm", "abCm", "taskCm"))
-    {
-        g_task1DistancePulse = limit_float(value, 0.0f, 300.0f) * ENCODER_PULSE_PER_CM;
-        return;
-    }
-    if (str_is_name(name, "task2Distance", "task2Pulse", "cdDistance"))
-    {
-        g_task2DistancePulse = limit_float(value, 0.0f, 30000.0f);
-        return;
-    }
-    if (str_is_name(name, "task2Cm", "task2DistCm", "t2Cm"))
-    {
-        g_task2DistancePulse = limit_float(value, 0.0f, 300.0f) * ENCODER_PULSE_PER_CM;
-        return;
-    }
-    if (str_is_name(name, "stopOffset", "straightOffset", "brakeOffset"))
-    {
-        g_taskStopOffsetPulse = limit_float(value, 0.0f, 2000.0f);
-        return;
-    }
-    if (str_is_name(name, "arcMinTime", "arcMin", "arcTime"))
-    {
-        g_arcMinTimeMs = (uint16_t)limit_float(value, 0.0f, 20000.0f);
-        return;
-    }
-    if (str_is_name(name, "arcMaxTime", "arcTimeout", "arcLimitTime"))
-    {
-        g_arcMaxTimeMs = (uint16_t)limit_float(value, 500.0f, 60000.0f);
-        return;
-    }
-    if (str_is_name(name, "arcYawTarget", "arcYaw", "arcAngle"))
-    {
-        g_arcYawTarget = limit_float(value, 30.0f, 180.0f);
-        return;
-    }
-    if (str_is_name(name, "arcSpeed", "arcTraceSpeed", "arcV"))
-    {
-        g_traceBaseSpeed = limit_float(value, 0.0f, 120.0f);
-        return;
-    }
-}
-
-static void Main_ApplyJoystickPacket(char **tok, int n)
-{
-    int turnRaw;
-    int forwardRaw;
-    float maxForward;
-    float maxTurn;
-
-    if (n < 3)
-    {
-        return;
-    }
-    if (g_safetyLocked || g_straightActive || g_arcActive || g_workMode != WORK_BT)
-    {
-        return;
-    }
-
-    turnRaw = atoi(tok[1]);
-    forwardRaw = atoi(tok[2]);
-
-    maxForward = g_maxForwardCmd * g_speedScale;
-    maxTurn = g_maxTurnCmd * g_speedScale;
-
-    g_targetForwardSpeed = limit_float((float)forwardRaw * maxForward / 100.0f, -maxForward, maxForward);
-    g_targetTurnSpeed = limit_float((float)(-turnRaw) * maxTurn / 100.0f, -maxTurn, maxTurn);
-    g_carEnable = 1;
-}
-
-static void Main_ApplyPacket(char *payload)
-{
-    char *tok[12];
-    int n;
-    char *p;
-
-    n = 0;
-    p = payload;
-    tok[n++] = p;
-    while (*p != '\0' && n < 12)
-    {
-        if (*p == ',')
-        {
-            *p = '\0';
-            tok[n++] = p + 1;
-        }
-        p++;
-    }
-
-    if (n <= 0 || tok[0][0] == '\0')
-    {
-        return;
-    }
-
-    if (str_is_name(tok[0], "key", "k", 0))
-    {
-        if (n >= 3 && str_is_down(tok[2]))
-        {
-            if (str_is_name(tok[1], "emergency", "emg", "stop"))
-            {
-                App_EmergencyStop();
-                return;
-            }
-            if (str_is_name(tok[1], "unlock", "release", "resume"))
-            {
-                App_UnlockControl();
-                return;
-            }
-            if (str_is_name(tok[1], "presetFast", "fast", "fastPreset"))
-            {
-                ApplyFastPreset();
-                return;
-            }
-            if (str_is_name(tok[1], "encClear", "encoderClear", "clearEnc"))
-            {
-                Encoder_DebugClearTotals();
-                return;
-            }
-            if (str_is_name(tok[1], "encDebug", "encoderDebug", "encDbg"))
-            {
-                g_plotMode = 1U;
-                Encoder_DebugClearTotals();
-                return;
-            }
-            if (str_is_name(tok[1], "mpuDebug", "gyroDebug", "yawDebug"))
-            {
-                g_plotMode = 2U;
-                if (!g_mpuReady)
-                {
-                    MPU_AppInit();
-                }
-                Prompt_Start(180);
-                return;
-            }
-            if (str_is_name(tok[1], "mpuCalib", "gyroCalib", "calib"))
-            {
-                g_plotMode = 2U;
-                MPU_CalibrateGyroZ();
-                return;
-            }
-            if (str_is_name(tok[1], "yawZero", "mpuZero", "zeroYaw"))
-            {
-                MPU_ResetYaw();
-                Prompt_Start(180);
-                return;
-            }
-            if (str_is_name(tok[1], "task1", "selectTask1", "t1"))
-            {
-                Task_SelectTask1();
-                return;
-            }
-            if (str_is_name(tok[1], "task2", "selectTask2", "t2"))
-            {
-                Task_SelectTask2();
-                return;
-            }
-            if (str_is_name(tok[1], "start", "run", "taskStart"))
-            {
-                Task_StartSelected();
-                return;
-            }
-            if (str_is_name(tok[1], "taskStop", "taskReset", "taskIdle"))
-            {
-                Task_Stop();
-                return;
-            }
-            if (str_is_name(tok[1], "straight", "straightTest", "goStraight"))
-            {
-                Task_Reset();
-                Straight_Start();
-                return;
-            }
-            if (str_is_name(tok[1], "arcTest", "arc", "arcRun"))
-            {
-                Task_Reset();
-                Arc_Start();
-                return;
-            }
-            if (str_is_name(tok[1], "plotNormal", "normalPlot", "plot0"))
-            {
-                g_plotMode = 0U;
-                Prompt_Start(160);
-                return;
-            }
-            if (str_is_name(tok[1], "tracing", "trace", "line"))
-            {
-                App_StartTracingMode();
-                return;
-            }
-            if (str_is_name(tok[1], "Bluetooth", "BT", "remote"))
-            {
-                App_StartBluetoothMode();
-                return;
-            }
-        }
-        return;
-    }
-
-    if (str_is_name(tok[0], "slider", "s", 0))
-    {
-        if (n >= 3)
-        {
-            Main_ApplySliderPacket(tok[1], (float)atof(tok[2]));
-        }
-        return;
-    }
-
-    if (str_is_name(tok[0], "joystick", "j", 0))
-    {
-        Main_ApplyJoystickPacket(tok, n);
-        return;
-    }
-
-    if (str_is_name(tok[0], "cmd", "car", "vel"))
-    {
-        float maxForward;
-        float maxTurn;
-
-        if (n >= 3 && !g_safetyLocked && g_workMode == WORK_BT)
-        {
-            maxForward = g_maxForwardCmd * g_speedScale;
-            maxTurn = g_maxTurnCmd * g_speedScale;
-            g_targetForwardSpeed = limit_float((float)atof(tok[1]), -maxForward, maxForward);
-            g_targetTurnSpeed = limit_float((float)atof(tok[2]), -maxTurn, maxTurn);
-            g_carEnable = 1;
-        }
-        return;
-    }
-}
-
-static void Main_BTProcess(void)
-{
-    static uint8_t receiving = 0;
-    static uint8_t index = 0;
-    static char packet[128];
-    uint8_t byte;
-
-    while (Serial_ReadByte(&byte))
-    {
-        char c;
-        c = (char)byte;
-
-        if (c == '[')
-        {
-            receiving = 1;
-            index = 0;
-            continue;
-        }
-
-        if (!receiving)
-        {
-            continue;
-        }
-
-        if (c == ']')
-        {
-            packet[index] = '\0';
-            receiving = 0;
-            Main_ApplyPacket(packet);
-            g_lastCmdTickMs = 0;
-            continue;
-        }
-
-        if (c == '\r' || c == '\n')
-        {
-            continue;
-        }
-
-        if (index < sizeof(packet) - 1U)
-        {
-            packet[index++] = c;
-        }
-        else
-        {
-            receiving = 0;
-            index = 0;
-        }
-    }
-}
-
-/* ================================================================
- * 11. 八路灰度循迹算法与 GPIO 直读
+ * 12. 八路灰度循迹算法与 GPIO 直读
  * ================================================================ */
 
 #define LINE_AD0_PORT      GPIOA
 #define LINE_AD0_PIN       GPIO_Pin_8
-
 #define LINE_AD1_PORT      GPIOB
 #define LINE_AD1_PIN       GPIO_Pin_3
-
 #define LINE_AD2_PORT      GPIOB
 #define LINE_AD2_PIN       GPIO_Pin_4
-
 #define LINE_OUT_PORT      GPIOB
 #define LINE_OUT_PIN       GPIO_Pin_0
 
@@ -1736,12 +875,10 @@ static void Line_GPIOForceInit(void)
 
     RCC_APB2PeriphClockCmd(RCC_APB2Periph_AFIO, ENABLE);
     RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA | RCC_APB2Periph_GPIOB, ENABLE);
-
     GPIO_PinRemapConfig(GPIO_Remap_SWJ_JTAGDisable, ENABLE);
 
     GPIO_InitStructure.GPIO_Mode = GPIO_Mode_Out_PP;
     GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
-
     GPIO_InitStructure.GPIO_Pin = LINE_AD0_PIN;
     GPIO_Init(GPIOA, &GPIO_InitStructure);
 
@@ -1761,37 +898,16 @@ static void Line_SelectChannelDirect(uint8_t channel)
 {
     volatile uint16_t d;
 
-    if (channel & 0x01U)
-    {
-        GPIO_SetBits(LINE_AD0_PORT, LINE_AD0_PIN);
-    }
-    else
-    {
-        GPIO_ResetBits(LINE_AD0_PORT, LINE_AD0_PIN);
-    }
+    if (channel & 0x01U) GPIO_SetBits(LINE_AD0_PORT, LINE_AD0_PIN);
+    else GPIO_ResetBits(LINE_AD0_PORT, LINE_AD0_PIN);
 
-    if (channel & 0x02U)
-    {
-        GPIO_SetBits(LINE_AD1_PORT, LINE_AD1_PIN);
-    }
-    else
-    {
-        GPIO_ResetBits(LINE_AD1_PORT, LINE_AD1_PIN);
-    }
+    if (channel & 0x02U) GPIO_SetBits(LINE_AD1_PORT, LINE_AD1_PIN);
+    else GPIO_ResetBits(LINE_AD1_PORT, LINE_AD1_PIN);
 
-    if (channel & 0x04U)
-    {
-        GPIO_SetBits(LINE_AD2_PORT, LINE_AD2_PIN);
-    }
-    else
-    {
-        GPIO_ResetBits(LINE_AD2_PORT, LINE_AD2_PIN);
-    }
+    if (channel & 0x04U) GPIO_SetBits(LINE_AD2_PORT, LINE_AD2_PIN);
+    else GPIO_ResetBits(LINE_AD2_PORT, LINE_AD2_PIN);
 
-    for (d = 0; d < 2000; d++)
-    {
-        __NOP();
-    }
+    for (d = 0; d < 2000; d++) __NOP();
 }
 
 static uint8_t Line_ReadOneDirect(uint8_t channel)
@@ -1802,21 +918,10 @@ static uint8_t Line_ReadOneDirect(uint8_t channel)
     volatile uint16_t d;
 
     Line_SelectChannelDirect(channel);
-
     a = (uint8_t)GPIO_ReadInputDataBit(LINE_OUT_PORT, LINE_OUT_PIN);
-
-    for (d = 0; d < 300; d++)
-    {
-        __NOP();
-    }
-
+    for (d = 0; d < 300; d++) __NOP();
     b = (uint8_t)GPIO_ReadInputDataBit(LINE_OUT_PORT, LINE_OUT_PIN);
-
-    for (d = 0; d < 300; d++)
-    {
-        __NOP();
-    }
-
+    for (d = 0; d < 300; d++) __NOP();
     c = (uint8_t)GPIO_ReadInputDataBit(LINE_OUT_PORT, LINE_OUT_PIN);
 
     return (uint8_t)(((uint16_t)a + (uint16_t)b + (uint16_t)c) >= 2U);
@@ -1825,27 +930,20 @@ static uint8_t Line_ReadOneDirect(uint8_t channel)
 static void Line_ReadAllDirect(uint8_t raw[GRAYSCALE_CHANNELS])
 {
     uint8_t i;
-
-    for (i = 0; i < GRAYSCALE_CHANNELS; i++)
-    {
-        raw[i] = Line_ReadOneDirect(i);
-    }
+    for (i = 0; i < GRAYSCALE_CHANNELS; i++) raw[i] = Line_ReadOneDirect(i);
 }
 
 static void Line_Update(void)
 {
     uint8_t raw[GRAYSCALE_CHANNELS];
     static const int16_t weight[GRAYSCALE_CHANNELS] = {-350, -250, -150, -50, 50, 150, 250, 350};
-    int32_t sum;
-    int16_t count;
-    uint8_t mask;
+    int32_t sum = 0;
+    int16_t count = 0;
+    uint8_t mask = 0;
     uint8_t i;
     uint8_t blackLevel;
     uint8_t reverseOrder;
 
-    sum = 0;
-    count = 0;
-    mask = 0;
     blackLevel = (g_lineBlackLevelF <= 0.5f) ? 0U : 1U;
     reverseOrder = (g_lineReverseOrderF <= 0.5f) ? 0U : 1U;
 
@@ -1854,10 +952,7 @@ static void Line_Update(void)
     g_lineRawMask = 0;
     for (i = 0; i < GRAYSCALE_CHANNELS; i++)
     {
-        if (raw[i] == blackLevel)
-        {
-            g_lineRawMask |= (uint8_t)(1U << i);
-        }
+        if (raw[i] == blackLevel) g_lineRawMask |= (uint8_t)(1U << i);
     }
 
     for (i = 0; i < GRAYSCALE_CHANNELS; i++)
@@ -1886,7 +981,6 @@ static void Line_Update(void)
         g_lineValid = 1;
         rawError = (float)(sum / count);
         alpha = limit_float(g_lineFilterAlpha, 0.0f, 1.0f);
-
         g_lineErrorFiltered = g_lineErrorFiltered * (1.0f - alpha) + rawError * alpha;
         g_lineError = (int16_t)g_lineErrorFiltered;
         g_lastLineDir = (g_lineError >= 0) ? 1 : -1;
@@ -1895,10 +989,7 @@ static void Line_Update(void)
     else
     {
         g_lineValid = 0;
-        if (g_lineLostMs < 60000U)
-        {
-            g_lineLostMs += CONTROL_PERIOD_MS;
-        }
+        if (g_lineLostMs < 60000U) g_lineLostMs += CONTROL_PERIOD_MS;
     }
 }
 
@@ -1951,13 +1042,9 @@ static void Tracing_Control10ms(void)
         float minForward;
 
         e = absf_local((float)g_lineError) / 350.0f;
-        if (e > 1.0f)
-        {
-            e = 1.0f;
-        }
+        if (e > 1.0f) e = 1.0f;
 
         slowRatio = 1.0f - limit_float(g_lineSlowGain, 0.0f, 0.95f) * e;
-
         if ((g_lineMask & 0xC3U) != 0U)
         {
             slowRatio *= limit_float(g_lineEdgeSpeedRatio, 0.05f, 1.0f);
@@ -1965,10 +1052,7 @@ static void Tracing_Control10ms(void)
 
         forward = g_traceBaseSpeed * g_speedScale * slowRatio;
         minForward = g_traceSearchSpeed * g_speedScale;
-        if (forward < minForward)
-        {
-            forward = minForward;
-        }
+        if (forward < minForward) forward = minForward;
 
         turn = Line_CalcTurnCmd() * g_speedScale;
     }
@@ -1981,10 +1065,941 @@ static void Tracing_Control10ms(void)
     g_targetForwardSpeed = slew_float(g_targetForwardSpeed, forward, g_forwardSlewStep);
     g_targetTurnSpeed = slew_float(g_targetTurnSpeed, turn, g_turnSlewStep);
     g_carEnable = 1;
+    g_lastCmdTickMs = 0;
 }
 
 /* ================================================================
- * 12. 速度闭环、电机输出、显示和按键
+ * 13. arcTest 独立测试：保留旧 yaw 结束判断
+ * ================================================================ */
+
+static void Arc_Start(void)
+{
+    if (g_safetyLocked)
+    {
+        Prompt_Start(80);
+        return;
+    }
+
+    if (!g_mpuReady) MPU_AppInit();
+    if (!g_mpuReady || !g_mpuCalibrated)
+    {
+        g_plotMode = 2U;
+        Control_ForcePWMZero();
+        Prompt_Start(900);
+        return;
+    }
+
+    g_straightActive = 0;
+    g_arcDone = 0;
+    g_arcRunMs = 0;
+    g_arcStartYaw = g_yawDeg;
+    g_arcDeltaYaw = 0.0f;
+    g_workMode = WORK_TRACING;
+    g_plotMode = 4U;
+
+    g_lineLostMs = 0;
+    g_lineErrorFiltered = 0.0f;
+    g_lineLastCtrlError = 0.0f;
+
+    Control_ForcePWMZero();
+    Encoder_ClearTotalsOnly();
+
+    g_targetForwardSpeed = 0.0f;
+    g_targetTurnSpeed = 0.0f;
+    g_carEnable = 1;
+    g_lastCmdTickMs = 0;
+    g_arcActive = 1;
+
+    PID_Reset(&ForwardPID);
+    PID_Reset(&TurnPID);
+    Prompt_Start(180);
+}
+
+static void Arc_Finish(void)
+{
+    g_arcActive = 0;
+    g_arcDone = 1;
+    g_workMode = WORK_BT;
+    Control_ForcePWMZero();
+    g_plotMode = 4U;
+    Prompt_Start(700);
+}
+
+static void Arc_Control10ms(void)
+{
+    float absDelta;
+
+    if (!g_arcActive) return;
+
+    if (g_arcRunMs < 60000U - CONTROL_PERIOD_MS) g_arcRunMs += CONTROL_PERIOD_MS;
+
+    g_arcDeltaYaw = wrap_180(g_yawDeg - g_arcStartYaw);
+    absDelta = absf_local(g_arcDeltaYaw);
+
+    if (((g_arcRunMs >= g_arcMinTimeMs) && (absDelta >= g_arcYawTarget)) ||
+        (g_arcRunMs >= g_arcMaxTimeMs))
+    {
+        Arc_Finish();
+        return;
+    }
+
+    Tracing_Control10ms();
+}
+
+/* ================================================================
+ * 14. task2_encoder_v1 状态机
+ * ================================================================ */
+
+static uint8_t Task2_IsSearchState(void)
+{
+    return (g_taskState == TASK2_SEARCH_ARC_BC || g_taskState == TASK2_SEARCH_ARC_DA);
+}
+
+static uint8_t Task2_IsTraceState(void)
+{
+    return (g_taskState == TASK2_TRACE_ARC_BC || g_taskState == TASK2_TRACE_ARC_DA);
+}
+
+static uint8_t Task2_IsAlignState(void)
+{
+    return (g_taskState == TASK2_ALIGN_C || g_taskState == TASK2_ALIGN_A);
+}
+
+static uint8_t Task2_IsSpecialState(void)
+{
+    return (uint8_t)(Task2_IsSearchState() || Task2_IsTraceState() || Task2_IsAlignState());
+}
+
+static void Task2_SearchArcStart(float turnSign)
+{
+    g_straightActive = 0;
+    g_arcActive = 0;
+    g_workMode = WORK_BT;
+    g_plotMode = 4U;
+
+    g_task2CurrentTurnSign = (turnSign < 0.0f) ? -1.0f : 1.0f;
+    g_task2LineValidMs = 0;
+    g_task2LineLostMs = 0;
+    g_arcRunMs = 0;
+    g_arcStartYaw = g_yawDeg;
+    g_arcDeltaYaw = 0.0f;
+
+    g_task2SearchStartPulse = (float)g_forwardEncoderTotal;
+
+    g_lineLostMs = 0;
+    g_lineErrorFiltered = 0.0f;
+    g_lineLastCtrlError = 0.0f;
+
+    g_carEnable = 1;
+    g_lastCmdTickMs = 0;
+}
+
+static void Task2_StartTraceArc(void)
+{
+    /* 真正看到黑线后，才清零编码器，开始统计半圆弧段脉冲差。 */
+    Encoder_ClearTotalsOnly();
+
+    g_arcRunMs = 0;
+    g_arcStartYaw = g_yawDeg;
+    g_arcDeltaYaw = 0.0f;
+    g_task2LineLostMs = 0;
+    g_task2LineValidMs = 0;
+
+    g_lineLostMs = 0;
+    g_lineErrorFiltered = 0.0f;
+    g_lineLastCtrlError = 0.0f;
+
+    if (g_taskState == TASK2_SEARCH_ARC_BC) g_taskState = TASK2_TRACE_ARC_BC;
+    else if (g_taskState == TASK2_SEARCH_ARC_DA) g_taskState = TASK2_TRACE_ARC_DA;
+
+    PID_Reset(&ForwardPID);
+    PID_Reset(&TurnPID);
+    Prompt_Start(120);
+}
+
+static void Task2_FinishTraceArc(void)
+{
+    Control_ForcePWMZero();
+
+    if (g_taskState == TASK2_TRACE_ARC_BC)
+    {
+        g_taskState = TASK2_ALIGN_C;
+        Prompt_Start(180);
+        return;
+    }
+
+    if (g_taskState == TASK2_TRACE_ARC_DA)
+    {
+        g_taskState = TASK2_ALIGN_A;
+        Prompt_Start(180);
+        return;
+    }
+}
+
+static void Task2_FinishAlign(void)
+{
+    Control_ForcePWMZero();
+
+    if (g_taskState == TASK2_ALIGN_C)
+    {
+        /* C 点补角完成后，进入 C->D 直线。Straight_Start 会清零编码器并锁当前 yaw。 */
+        g_taskState = TASK2_STRAIGHT_CD;
+        g_straightDistancePulse = g_task2StraightToSearchPulse;
+        Straight_Start();
+
+        if (!g_straightActive)
+        {
+            g_taskRunning = 0;
+            g_taskState = TASK_READY_TASK2;
+        }
+        Prompt_Start(160);
+        return;
+    }
+
+    if (g_taskState == TASK2_ALIGN_A)
+    {
+        /* task2 完成一圈，到 A 点停车并长提示。 */
+        g_taskRunning = 0;
+        g_taskState = TASK2_FINISH;
+        g_workMode = WORK_BT;
+        g_plotMode = 3U;
+        Control_ForcePWMZero();
+        Prompt_Start(1000);
+        return;
+    }
+}
+
+static void Task2_ControlSearch10ms(void)
+{
+    float searchDeltaPulse;
+
+    if (g_arcRunMs < 60000U - CONTROL_PERIOD_MS) g_arcRunMs += CONTROL_PERIOD_MS;
+    g_arcDeltaYaw = wrap_180(g_yawDeg - g_arcStartYaw);
+
+    /* SEARCH 阶段只读灰度，不调用普通循迹。
+     * 因为刚从直线提前切入时还没接触黑线，丢线是正常状态。
+     */
+    Line_Update();
+
+    if (g_lineValid)
+    {
+        if (g_task2LineValidMs < 60000U - CONTROL_PERIOD_MS)
+        {
+            g_task2LineValidMs += CONTROL_PERIOD_MS;
+        }
+    }
+    else
+    {
+        g_task2LineValidMs = 0;
+    }
+
+    if (g_task2LineValidMs >= g_task2LineFoundConfirmMs)
+    {
+        Task2_StartTraceArc();
+        return;
+    }
+
+    searchDeltaPulse = absf_local((float)g_forwardEncoderTotal - g_task2SearchStartPulse);
+    if (searchDeltaPulse >= g_task2SearchMaxPulse)
+    {
+        /* 保护：提前找线后仍然很久找不到黑线，停车等待人工处理。 */
+        Task_Stop();
+        return;
+    }
+
+    Task2_ApplyYawStraightHold(g_task2SearchSpeed);
+}
+
+static void Task2_ControlTrace10ms(void)
+{
+    float forwardAbs;
+
+    if (g_arcRunMs < 60000U - CONTROL_PERIOD_MS)
+    {
+        g_arcRunMs += CONTROL_PERIOD_MS;
+    }
+    g_arcDeltaYaw = wrap_180(g_yawDeg - g_arcStartYaw);
+
+    /*
+     * 重要修改：半圆弧 TRACE 阶段不能先调用 Tracing_Control10ms()。
+     * 原因：普通循迹函数在丢线时会进入 lostTurn 找线逻辑，
+     * 会在 C/A 出弯后继续大幅转向，导致左右轮差过冲。
+     *
+     * 因此这里先单独读取灰度：
+     *   - 如果仍然在线上：才执行正常灰度循迹；
+     *   - 如果已经满足“弧线最小时间 + 最小平均脉冲”后丢线：
+     *     立即退出 TRACE，进入 ALIGN 补角状态；
+     *   - 如果还没跑够最小弧线长度就丢线：认为可能是中途短暂丢线，
+     *     才允许普通循迹的找线逻辑继续工作。
+     */
+    Line_Update();
+    forwardAbs = absf_local((float)g_forwardEncoderTotal);
+
+    if (g_lineValid)
+    {
+        g_task2LineLostMs = 0;
+
+        /* 仍在黑线上，正常执行灰度循迹。
+         * 注意：Tracing_Control10ms() 内部会再次 Line_Update()，
+         * 这里会重复读一次灰度，但逻辑安全，后续如需优化可拆分循迹函数。
+         */
+        Tracing_Control10ms();
+        g_lastCmdTickMs = 0;
+        return;
+    }
+
+    if (g_task2LineLostMs < 60000U - CONTROL_PERIOD_MS)
+    {
+        g_task2LineLostMs += CONTROL_PERIOD_MS;
+    }
+
+    /* C/A 出弯：已经跑够半圆弧基本长度后，一旦丢线就不要找线，
+     * 直接进入补角状态。g_task2LineLostConfirmMs 默认为 0，表示立即触发；
+     * 若灰度抖动严重，可以通过 [slider,arcLostMs,10] 加少量确认时间。
+     */
+    if ((g_arcRunMs >= g_arcMinTimeMs) &&
+        (forwardAbs >= g_task2ArcMinForwardPulse) &&
+        (g_task2LineLostMs >= g_task2LineLostConfirmMs))
+    {
+        g_targetForwardSpeed = 0.0f;
+        g_targetTurnSpeed = 0.0f;
+        g_carEnable = 1;
+        g_lastCmdTickMs = 0;
+        Task2_FinishTraceArc();
+        return;
+    }
+
+    /* 还没有跑够半圆弧最小距离时丢线，认为可能是弯道中途瞬时丢线，
+     * 这时才允许普通循迹的 lostTurn 找线逻辑。
+     */
+    Tracing_Control10ms();
+    g_lastCmdTickMs = 0;
+}
+
+static void Task2_ControlAlign10ms(void)
+{
+    int32_t wheelDiffAbs;
+    int32_t targetDiff;
+    float turnTarget;
+
+    wheelDiffAbs = abs_i32_local(Task2_GetWheelDiffPulse());
+    targetDiff = (int32_t)g_task2ArcWheelDiffTarget;
+
+    if (wheelDiffAbs >= targetDiff)
+    {
+        Task2_FinishAlign();
+        return;
+    }
+
+    if (g_taskState == TASK2_ALIGN_C) turnTarget = g_task2BcTurnSign * g_task2AlignTurnSpeed;
+    else turnTarget = g_task2DaTurnSign * g_task2AlignTurnSpeed;
+
+    g_targetForwardSpeed = slew_float(g_targetForwardSpeed, 0.0f, g_forwardSlewStep);
+    g_targetTurnSpeed = slew_float(g_targetTurnSpeed, turnTarget, g_turnSlewStep);
+    g_carEnable = 1;
+    g_lastCmdTickMs = 0;
+}
+
+static void Task2_Control10ms(void)
+{
+    if (Task2_IsSearchState())
+    {
+        Task2_ControlSearch10ms();
+        return;
+    }
+
+    if (Task2_IsTraceState())
+    {
+        Task2_ControlTrace10ms();
+        return;
+    }
+
+    if (Task2_IsAlignState())
+    {
+        Task2_ControlAlign10ms();
+        return;
+    }
+}
+
+static void Task_Reset(void)
+{
+    g_taskState = TASK_IDLE;
+    /* 不清空 g_taskSelected：本地面板 K2 选中的任务需要在待机中保持。 */
+    g_taskRunning = 0;
+    g_straightActive = 0;
+    g_arcActive = 0;
+    g_task2LineValidMs = 0;
+    g_task2LineLostMs = 0;
+    g_task2SearchStartPulse = 0.0f;
+}
+
+static void Task_SelectTask1(void)
+{
+    if (g_safetyLocked)
+    {
+        Prompt_Start(80);
+        return;
+    }
+
+    g_taskSelected = 1;
+    g_taskRunning = 0;
+    g_taskState = TASK_READY_TASK1;
+    g_workMode = WORK_STANDBY;
+    g_localMode = LOCAL_STANDBY;
+    g_plotMode = 3U;
+    Control_ForcePWMZero();
+    Prompt_Start(220);
+}
+
+static void Task_SelectTask2(void)
+{
+    if (g_safetyLocked)
+    {
+        Prompt_Start(80);
+        return;
+    }
+
+    g_taskSelected = 2;
+    g_taskRunning = 0;
+    g_taskState = TASK_READY_TASK2;
+    g_workMode = WORK_STANDBY;
+    g_localMode = LOCAL_STANDBY;
+    g_plotMode = 3U;
+    Control_ForcePWMZero();
+    Prompt_Start(260);
+}
+
+static void Task_SelectOnly(uint8_t task)
+{
+    if (task < 1U || task > 4U)
+    {
+        task = 1U;
+    }
+
+    g_taskSelected = task;
+    g_taskRunning = 0;
+
+    if (task == 1U)
+    {
+        g_taskState = TASK_READY_TASK1;
+    }
+    else if (task == 2U)
+    {
+        g_taskState = TASK_READY_TASK2;
+    }
+    else
+    {
+        /* task3/task4 暂未实现：仅保留选择状态，K3 执行时空执行提示。 */
+        g_taskState = TASK_IDLE;
+    }
+}
+
+static void Task_StartSelected(void)
+{
+    if (g_safetyLocked)
+    {
+        Prompt_Start(80);
+        return;
+    }
+
+    if (g_taskSelected == 1U)
+    {
+        /* task1：A->B 直线 100 cm，到 B 停车提示。
+         * 仍使用已验证的 7030-170=6860 pulse 停止阈值。
+         */
+        g_straightDistancePulse = Task_GetStraightStopThreshold(g_task1DistancePulse);
+        g_taskRunning = 1;
+        g_taskState = TASK_STRAIGHT_AB;
+        Straight_Start();
+
+        if (!g_straightActive)
+        {
+            g_taskRunning = 0;
+            g_taskState = TASK_READY_TASK1;
+        }
+        return;
+    }
+
+    if (g_taskSelected == 2U)
+    {
+        /* task2：使用编码器脉冲差架构。 */
+        g_straightDistancePulse = g_task2StraightToSearchPulse;
+        g_taskRunning = 1;
+        g_taskState = TASK2_STRAIGHT_AB;
+        Straight_Start();
+
+        if (!g_straightActive)
+        {
+            g_taskRunning = 0;
+            g_taskState = TASK_READY_TASK2;
+        }
+        return;
+    }
+
+    /* task3/task4 暂未实现：空执行，只声光提示，不运动。 */
+    Control_ForcePWMZero();
+    g_taskRunning = 0;
+    g_taskState = TASK_IDLE;
+    Prompt_Start(700);
+}
+
+static void Task_Stop(void)
+{
+    g_straightActive = 0;
+    g_arcActive = 0;
+    g_taskRunning = 0;
+    g_taskState = TASK_IDLE;
+    g_workMode = WORK_STANDBY;
+    g_localMode = LOCAL_STANDBY;
+    g_plotMode = 0U;
+    Control_ForcePWMZero();
+    Prompt_Start(300);
+}
+
+/* ================================================================
+ * 15. 本地按键面板逻辑
+ * ================================================================ */
+
+static void Local_EnterStandby(void)
+{
+    g_localMode = LOCAL_STANDBY;
+    g_workMode = WORK_STANDBY;
+    g_plotMode = 0U;
+    Control_ForcePWMZero();
+}
+
+static void Local_EnterEncoderDebug(void)
+{
+    g_localMode = LOCAL_ENCODER_DEBUG;
+    g_workMode = WORK_STANDBY;
+    g_plotMode = 1U;
+    Control_ForcePWMZero();
+    Encoder_DebugClearTotals();
+}
+
+static void Local_EnterMpuDebug(void)
+{
+    g_localMode = LOCAL_MPU_DEBUG;
+    g_workMode = WORK_STANDBY;
+    g_plotMode = 2U;
+    Control_ForcePWMZero();
+    if (!g_mpuReady)
+    {
+        MPU_AppInit();
+    }
+    Prompt_Start(180);
+}
+
+static void Local_CycleMode(void)
+{
+    if (g_taskRunning || g_straightActive || g_arcActive || Task2_IsSpecialState())
+    {
+        Prompt_Start(80);
+        return;
+    }
+
+    if (g_localMode == LOCAL_STANDBY)
+    {
+        Local_EnterEncoderDebug();
+    }
+    else if (g_localMode == LOCAL_ENCODER_DEBUG)
+    {
+        Local_EnterMpuDebug();
+    }
+    else
+    {
+        Local_EnterStandby();
+        Prompt_Start(160);
+    }
+}
+
+static void Local_SelectNextTask(void)
+{
+    if (g_taskRunning || g_straightActive || g_arcActive || Task2_IsSpecialState())
+    {
+        Prompt_Start(80);
+        return;
+    }
+
+    if (g_taskSelected < 1U || g_taskSelected >= 4U)
+    {
+        g_taskSelected = 1U;
+    }
+    else
+    {
+        g_taskSelected++;
+    }
+
+    Task_SelectOnly(g_taskSelected);
+    g_localMode = LOCAL_STANDBY;
+    g_workMode = WORK_STANDBY;
+    g_plotMode = 0U;
+    Control_ForcePWMZero();
+    Prompt_Start((uint16_t)(120U + 70U * g_taskSelected));
+}
+
+static void Local_ExecuteSelectedTask(void)
+{
+    if (g_safetyLocked)
+    {
+        Prompt_Start(80);
+        return;
+    }
+
+    if (g_taskRunning || g_straightActive || g_arcActive || Task2_IsSpecialState())
+    {
+        Prompt_Start(80);
+        return;
+    }
+
+    if (g_localMode == LOCAL_ENCODER_DEBUG)
+    {
+        Encoder_DebugClearTotals();
+        return;
+    }
+
+    if (g_localMode == LOCAL_MPU_DEBUG)
+    {
+        MPU_ResetYaw();
+        Prompt_Start(180);
+        return;
+    }
+
+    g_localMode = LOCAL_STANDBY;
+    g_workMode = WORK_STANDBY;
+    Task_StartSelected();
+}
+
+/* ================================================================
+ * 15. 模式切换和安全锁定
+ * ================================================================ */
+
+void App_EmergencyStop(void)
+{
+    g_safetyLocked = 1;
+    g_workMode = WORK_STANDBY;
+    g_localMode = LOCAL_STANDBY;
+    Task_Reset();
+    Control_ForcePWMZero();
+    Prompt_Start(500);
+}
+
+void App_UnlockControl(void)
+{
+    g_safetyLocked = 0;
+    g_workMode = WORK_STANDBY;
+    g_localMode = LOCAL_STANDBY;
+    g_plotMode = 0U;
+    Task_Reset();
+    g_lastCmdTickMs = 0;
+    Control_ForcePWMZero();
+    Prompt_Start(180);
+}
+
+void App_StartBluetoothMode(void)
+{
+    if (g_safetyLocked) return;
+
+    /* 蓝牙遥控模式只保留网页入口，实体按键不会进入该模式。 */
+    g_workMode = WORK_BT;
+    g_localMode = LOCAL_STANDBY;
+    Task_Reset();
+    g_lastCmdTickMs = 0;
+    Control_ForcePWMZero();
+    Prompt_Start(160);
+}
+
+void App_StartTracingMode(void)
+{
+    if (g_safetyLocked) return;
+
+    Task_Reset();
+    g_workMode = WORK_TRACING;
+    g_localMode = LOCAL_STANDBY;
+    g_lineLostMs = 0;
+    g_lineErrorFiltered = 0.0f;
+    g_lineLastCtrlError = 0.0f;
+    g_targetForwardSpeed = 0.0f;
+    g_targetTurnSpeed = 0.0f;
+    g_carEnable = 1;
+    g_lastCmdTickMs = 0;
+    Encoder_ClearAll();
+    PID_Reset(&ForwardPID);
+    PID_Reset(&TurnPID);
+    Prompt_Start(160);
+}
+
+/* ================================================================
+ * 16. 蓝牙/网页数据包解析
+ * ================================================================ */
+
+static void ApplySpeedLimitPercent(float percent)
+{
+    float ratio;
+    percent = limit_float(percent, 0.0f, 100.0f);
+    ratio = percent / 100.0f;
+    g_btSpeedLimitPercent = percent;
+    g_speedScale = ratio;
+    g_pwmLimit = PWM_LIMIT_MAX * ratio;
+}
+
+static void ApplyFastPreset(void)
+{
+    ApplySpeedLimitPercent(55.0f);
+
+    g_traceBaseSpeed = 60.0f;
+    g_lineKp = 0.350f;
+    g_lineKd = 0.600f;
+    g_lineTurnLimit = 180.0f;
+    g_lineMinTurn = 34.0f;
+    g_lineFilterAlpha = 0.58f;
+    g_lineSlowGain = 0.88f;
+    g_lineEdgeTurnExtra = 82.0f;
+    g_lineEdgeSpeedRatio = 0.24f;
+    g_forwardSlewStep = 14.0f;
+    g_turnSlewStep = 60.0f;
+    g_lineLostTurn = 130.0f;
+
+    g_lineTurnSign = 1.0f;
+    g_lineBlackLevelF = 1.0f;
+    g_lineReverseOrderF = 0.0f;
+
+    g_lineLostMs = 0;
+    g_lineErrorFiltered = 0.0f;
+    g_lineLastCtrlError = 0.0f;
+    PID_Reset(&ForwardPID);
+    PID_Reset(&TurnPID);
+    Prompt_Start(220);
+}
+
+static void Main_ApplySliderPacket(const char *name, float value)
+{
+    if (str_is_name(name, "RP", "rp", "speedLimit"))
+    {
+        ApplySpeedLimitPercent(value);
+        return;
+    }
+
+    if (str_is_name(name, "speedKp", "forwardKp", "fKp")) { g_forwardKp = limit_float(value, 0.0f, 80.0f); return; }
+    if (str_is_name(name, "speedKi", "forwardKi", "fKi")) { g_forwardKi = limit_float(value, 0.0f, 20.0f); return; }
+    if (str_is_name(name, "speedKd", "forwardKd", "fKd")) { g_forwardKd = limit_float(value, 0.0f, 30.0f); return; }
+    if (str_is_name(name, "turnKp", "diffKp", "tKp")) { g_turnKp = limit_float(value, 0.0f, 80.0f); return; }
+    if (str_is_name(name, "turnKi", "diffKi", "tKi")) { g_turnKi = limit_float(value, 0.0f, 20.0f); return; }
+    if (str_is_name(name, "turnKd", "diffKd", "tKd")) { g_turnKd = limit_float(value, 0.0f, 30.0f); return; }
+    if (str_is_name(name, "maxForward", "maxSpeed", "btSpeed")) { g_maxForwardCmd = limit_float(value, 0.0f, 200.0f); return; }
+    if (str_is_name(name, "maxTurn", "btTurn", "remoteTurn")) { g_maxTurnCmd = limit_float(value, 0.0f, 200.0f); return; }
+
+    if (str_is_name(name, "traceKp", "lineKp", "lineP")) { g_lineKp = limit_float(value, 0.0f, 1.0f); return; }
+    if (str_is_name(name, "traceKd", "lineKd", "lineD")) { g_lineKd = limit_float(value, 0.0f, 1.0f); return; }
+    if (str_is_name(name, "traceSpeed", "lineSpeed", "baseSpeed")) { g_traceBaseSpeed = limit_float(value, 0.0f, 120.0f); return; }
+    if (str_is_name(name, "turnLimit", "lineTurnLimit", "traceTurnLimit")) { g_lineTurnLimit = limit_float(value, 0.0f, 180.0f); return; }
+    if (str_is_name(name, "lostTurn", "lineLostTurn", "findTurn")) { g_lineLostTurn = limit_float(value, 0.0f, 180.0f); return; }
+
+    if (str_is_name(name, "filter", "lineFilter", "alpha"))
+    {
+        if (value > 1.0f) value = value / 100.0f;
+        g_lineFilterAlpha = limit_float(value, 0.0f, 1.0f);
+        return;
+    }
+    if (str_is_name(name, "slowGain", "lineSlow", "curveSlow"))
+    {
+        if (value > 1.0f) value = value / 100.0f;
+        g_lineSlowGain = limit_float(value, 0.0f, 0.95f);
+        return;
+    }
+    if (str_is_name(name, "edgeBoost", "edgeTurn", "edgeExtra")) { g_lineEdgeTurnExtra = limit_float(value, 0.0f, 100.0f); return; }
+    if (str_is_name(name, "edgeSlow", "edgeSpeed", "edgeRatio"))
+    {
+        if (value > 1.0f) value = value / 100.0f;
+        g_lineEdgeSpeedRatio = limit_float(value, 0.05f, 1.0f);
+        return;
+    }
+    if (str_is_name(name, "minTurn", "lineMinTurn", "traceMinTurn")) { g_lineMinTurn = limit_float(value, 0.0f, 80.0f); return; }
+    if (str_is_name(name, "forwardSlew", "speedSlew", "fSlew")) { g_forwardSlewStep = limit_float(value, 0.0f, 30.0f); return; }
+    if (str_is_name(name, "turnSlew", "diffSlew", "tSlew")) { g_turnSlewStep = limit_float(value, 0.0f, 60.0f); return; }
+    if (str_is_name(name, "lineSign", "traceSign", "turnSign")) { g_lineTurnSign = (value < 0.0f) ? -1.0f : 1.0f; return; }
+    if (str_is_name(name, "blackLevel", "lineLevel", "black")) { g_lineBlackLevelF = (value <= 0.0f) ? 0.0f : 1.0f; return; }
+    if (str_is_name(name, "lineReverse", "reverseLine", "sensorReverse")) { g_lineReverseOrderF = (value <= 0.0f) ? 0.0f : 1.0f; return; }
+
+    if (str_is_name(name, "yawSign", "gyroSign", "mpuSign")) { g_mpuYawSign = (value < 0.0f) ? -1.0f : 1.0f; return; }
+    if (str_is_name(name, "yawKp", "headingKp", "straightKp")) { g_yawKp = limit_float(value, 0.0f, 20.0f); return; }
+    if (str_is_name(name, "yawKd", "headingKd", "straightKd")) { g_yawKd = limit_float(value, 0.0f, 10.0f); return; }
+    if (str_is_name(name, "straightSpeed", "straightV", "lineV")) { g_straightSpeed = limit_float(value, 0.0f, 80.0f); return; }
+
+    if (str_is_name(name, "task2SearchPulse", "searchPulse", "toArcPulse"))
+    {
+        g_task2StraightToSearchPulse = limit_float(value, 1000.0f, 15000.0f);
+        return;
+    }
+    if (str_is_name(name, "arcWheelDiff", "wheelDiff", "arcDiff"))
+    {
+        g_task2ArcWheelDiffTarget = limit_float(value, 500.0f, 8000.0f);
+        return;
+    }
+    if (str_is_name(name, "arcMinPulse", "arcForwardPulse", "arcFwdPulse"))
+    {
+        g_task2ArcMinForwardPulse = limit_float(value, 1000.0f, 15000.0f);
+        return;
+    }
+    if (str_is_name(name, "arcFoundMs", "lineFoundMs", "foundMs"))
+    {
+        g_task2LineFoundConfirmMs = (uint16_t)limit_float(value, 10.0f, 2000.0f);
+        return;
+    }
+    if (str_is_name(name, "arcLostMs", "lineLostMs", "lostMs"))
+    {
+        g_task2LineLostConfirmMs = (uint16_t)limit_float(value, 0.0f, 3000.0f);
+        return;
+    }
+    if (str_is_name(name, "toArcSpeed", "arcSearchSpeed", "searchArcSpeed"))
+    {
+        g_task2SearchSpeed = limit_float(value, 0.0f, 60.0f);
+        return;
+    }
+    if (str_is_name(name, "alignTurn", "alignTurnSpeed", "arcAlignTurn"))
+    {
+        g_task2AlignTurnSpeed = limit_float(value, 0.0f, 80.0f);
+        return;
+    }
+    if (str_is_name(name, "bcTurnSign", "bcSign", "arcBcSign"))
+    {
+        g_task2BcTurnSign = (value < 0.0f) ? -1.0f : 1.0f;
+        return;
+    }
+    if (str_is_name(name, "daTurnSign", "daSign", "arcDaSign"))
+    {
+        g_task2DaTurnSign = (value < 0.0f) ? -1.0f : 1.0f;
+        return;
+    }
+
+    if (str_is_name(name, "plotMode", "debugMode", "dbg"))
+    {
+        if (value < 0.5f) g_plotMode = 0U;
+        else if (value < 1.5f) g_plotMode = 1U;
+        else if (value < 2.5f) g_plotMode = 2U;
+        else if (value < 3.5f) g_plotMode = 3U;
+        else g_plotMode = 4U;
+        return;
+    }
+}
+
+static void Main_ApplyJoystickPacket(char **tok, int n)
+{
+    int turnRaw;
+    int forwardRaw;
+    float maxForward;
+    float maxTurn;
+
+    if (n < 3) return;
+    if (g_safetyLocked || g_straightActive || g_arcActive || g_taskRunning || Task2_IsSpecialState() || g_workMode != WORK_BT) return;
+
+    turnRaw = atoi(tok[1]);
+    forwardRaw = atoi(tok[2]);
+
+    maxForward = g_maxForwardCmd * g_speedScale;
+    maxTurn = g_maxTurnCmd * g_speedScale;
+
+    g_targetForwardSpeed = limit_float((float)forwardRaw * maxForward / 100.0f, -maxForward, maxForward);
+    g_targetTurnSpeed = limit_float((float)(-turnRaw) * maxTurn / 100.0f, -maxTurn, maxTurn);
+    g_carEnable = 1;
+}
+
+static void Main_ApplyPacket(char *payload)
+{
+    char *tok[12];
+    int n;
+    char *p;
+
+    n = 0;
+    p = payload;
+    tok[n++] = p;
+    while (*p != '\0' && n < 12)
+    {
+        if (*p == ',')
+        {
+            *p = '\0';
+            tok[n++] = p + 1;
+        }
+        p++;
+    }
+
+    if (n <= 0 || tok[0][0] == '\0') return;
+
+    if (str_is_name(tok[0], "key", "k", 0))
+    {
+        if (n >= 3 && str_is_down(tok[2]))
+        {
+            if (str_is_name(tok[1], "emergency", "emg", "stop")) { App_EmergencyStop(); return; }
+            if (str_is_name(tok[1], "unlock", "release", "resume")) { App_UnlockControl(); return; }
+            if (str_is_name(tok[1], "presetFast", "fast", "fastPreset")) { ApplyFastPreset(); return; }
+            if (str_is_name(tok[1], "encClear", "encoderClear", "clearEnc")) { Encoder_DebugClearTotals(); return; }
+            if (str_is_name(tok[1], "encDebug", "encoderDebug", "encDbg")) { Local_EnterEncoderDebug(); return; }
+            if (str_is_name(tok[1], "mpuDebug", "gyroDebug", "yawDebug")) { Local_EnterMpuDebug(); return; }
+            if (str_is_name(tok[1], "mpuCalib", "gyroCalib", "calib")) { g_plotMode = 2U; MPU_CalibrateGyroZ(); return; }
+            if (str_is_name(tok[1], "yawZero", "mpuZero", "zeroYaw")) { MPU_ResetYaw(); Prompt_Start(180); return; }
+            if (str_is_name(tok[1], "task1", "selectTask1", "t1")) { Task_SelectTask1(); return; }
+            if (str_is_name(tok[1], "task2", "selectTask2", "t2")) { Task_SelectTask2(); return; }
+            if (str_is_name(tok[1], "task3", "selectTask3", "t3")) { Task_SelectOnly(3U); Prompt_Start(330); return; }
+            if (str_is_name(tok[1], "task4", "selectTask4", "t4")) { Task_SelectOnly(4U); Prompt_Start(400); return; }
+            if (str_is_name(tok[1], "start", "run", "taskStart")) { Task_StartSelected(); return; }
+            if (str_is_name(tok[1], "taskStop", "taskReset", "taskIdle")) { Task_Stop(); return; }
+            if (str_is_name(tok[1], "arcTest", "arc", "arcRun")) { Task_Reset(); Arc_Start(); return; }
+            if (str_is_name(tok[1], "tracing", "trace", "line")) { App_StartTracingMode(); return; }
+            if (str_is_name(tok[1], "Bluetooth", "BT", "remote")) { App_StartBluetoothMode(); return; }
+        }
+        return;
+    }
+
+    if (str_is_name(tok[0], "slider", "s", 0))
+    {
+        if (n >= 3) Main_ApplySliderPacket(tok[1], (float)atof(tok[2]));
+        return;
+    }
+
+    if (str_is_name(tok[0], "joystick", "j", 0))
+    {
+        Main_ApplyJoystickPacket(tok, n);
+        return;
+    }
+}
+
+static void Main_BTProcess(void)
+{
+    static uint8_t receiving = 0;
+    static uint8_t index = 0;
+    static char packet[128];
+    uint8_t byte;
+
+    while (Serial_ReadByte(&byte))
+    {
+        char c = (char)byte;
+        if (c == '[')
+        {
+            receiving = 1;
+            index = 0;
+            continue;
+        }
+        if (!receiving) continue;
+        if (c == ']')
+        {
+            packet[index] = '\0';
+            receiving = 0;
+            Main_ApplyPacket(packet);
+            g_lastCmdTickMs = 0;
+            continue;
+        }
+        if (c == '\r' || c == '\n') continue;
+        if (index < sizeof(packet) - 1U) packet[index++] = c;
+        else
+        {
+            receiving = 0;
+            index = 0;
+        }
+    }
+}
+
+/* ================================================================
+ * 17. 速度闭环、电机输出、显示和按键
  * ================================================================ */
 
 static void Control_Run10ms(void)
@@ -2016,7 +2031,11 @@ static void Control_Run10ms(void)
 
     Control_UpdatePIDParam();
 
-    if (g_straightActive)
+    if (Task2_IsSpecialState())
+    {
+        Task2_Control10ms();
+    }
+    else if (g_straightActive)
     {
         Straight_Control10ms();
     }
@@ -2068,54 +2087,51 @@ static void Control_Run10ms(void)
     Motor_SetPWM(g_leftPwm, g_rightPwm);
 }
 
+static int ModeCode(void)
+{
+    if (g_safetyLocked) return 9;
+    if (g_straightActive) return 3;
+    if (g_arcActive) return 4;
+    if (g_taskState == TASK_READY_TASK1) return 11;
+    if (g_taskState == TASK_READY_TASK2) return 21;
+    if (g_taskState == TASK2_SEARCH_ARC_BC) return 31;
+    if (g_taskState == TASK2_TRACE_ARC_BC) return 32;
+    if (g_taskState == TASK2_ALIGN_C) return 33;
+    if (g_taskState == TASK2_SEARCH_ARC_DA) return 34;
+    if (g_taskState == TASK2_TRACE_ARC_DA) return 35;
+    if (g_taskState == TASK2_ALIGN_A) return 36;
+    if (g_taskState == TASK2_FINISH) return 22;
+    if (g_taskState == TASK_FINISH) return 12;
+    if (g_workMode == WORK_STANDBY)
+    {
+        if (g_localMode == LOCAL_ENCODER_DEBUG) return 41;
+        if (g_localMode == LOCAL_MPU_DEBUG) return 42;
+        return 40;
+    }
+    return (int)g_workMode;
+}
+
 static char *ModeString(void)
 {
-    if (g_safetyLocked)
-    {
-        return "LOCK";
-    }
-    if (g_straightActive)
-    {
-        return "STR";
-    }
-    if (g_arcActive)
-    {
-        return "ARC";
-    }
-    if (g_workMode == WORK_TRACING)
-    {
-        return "TRACE";
-    }
-    return "BT";
+    if (g_safetyLocked) return "LOCK";
+    if (g_straightActive) return "STR";
+    if (Task2_IsSearchState()) return "SRCH";
+    if (Task2_IsTraceState()) return "ARC";
+    if (Task2_IsAlignState()) return "ALGN";
+    if (g_arcActive) return "ARC";
+    if (g_workMode == WORK_TRACING) return "TRACE";
+    if (g_workMode == WORK_BT) return "BT";
+    if (g_localMode == LOCAL_ENCODER_DEBUG) return "ENC";
+    if (g_localMode == LOCAL_MPU_DEBUG) return "MPU";
+    return "STBY";
 }
 
 static void Serial_SendPlotStatus(void)
 {
-    int modeCode;
-
-    modeCode = g_safetyLocked ? 9 :
-               (g_straightActive ? 3 :
-               (g_arcActive ? 4 :
-               ((g_taskState == TASK_READY_TASK1) ? 11 :
-               ((g_taskState == TASK_READY_TASK2) ? 21 :
-               ((g_taskState == TASK_FINISH) ? 12 :
-               ((g_taskState == TASK2_FINISH) ? 22 : (int)g_workMode))))));
+    int modeCode = ModeCode();
 
     if (g_plotMode == 1U)
     {
-        /*
-         * 编码器调试模式下的网页绘图回传格式：
-         * CH1  modeCode：0=蓝牙遥控，1=循迹，9=急停锁定
-         * CH2  左轮最近 10ms 编码器增量
-         * CH3  右轮最近 10ms 编码器增量
-         * CH4  实际前进速度
-         * CH5  实际转向速度
-         * CH6  目标前进速度
-         * CH7  目标转向速度
-         * CH8  左轮累计脉冲
-         * CH9  右轮累计脉冲
-         * CH10 左右平均累计脉冲
-         */
         Serial_Printf("[p,%d,%d,%d,%d,%d,%d,%d,%ld,%ld,%ld]\r\n",
                       modeCode,
                       (int)g_leftSpeed,
@@ -2132,19 +2148,6 @@ static void Serial_SendPlotStatus(void)
 
     if (g_plotMode == 2U)
     {
-        /*
-         * MPU6050 诊断/调试模式下的网页绘图回传格式：
-         * CH1  modeCode：0=蓝牙遥控，1=循迹，9=急停锁定
-         * CH2  yaw * 10，单位 0.1 度
-         * CH3  扣零偏后的 GyroZ * 10，单位 0.1 度/秒
-         * CH4  原始 GyroZ * 10，单位 0.1 度/秒
-         * CH5  GyroZ 零偏 * 10，单位 0.1 度/秒
-         * CH6  MPU ready，1=初始化成功
-         * CH7  MPU 错误码：0=正常，1=NACK，2=ID错误，3=参数错误，0xE1=运行中读失败，0xE2=校准样本不足
-         * CH8  WHO_AM_I 十进制读数：正常应为 104，也就是 0x68；255 常见于无通信；0 常见于总线被拉低
-         * CH9  MPU calibrated，1=已经完成零偏校准
-         * CH10 MPU 初始化尝试次数
-         */
         Serial_Printf("[p,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d]\r\n",
                       modeCode,
                       (int)(g_yawDeg * 10.0f),
@@ -2161,19 +2164,6 @@ static void Serial_SendPlotStatus(void)
 
     if (g_plotMode == 3U)
     {
-        /*
-         * straight 直线测试回传格式：
-         * CH1  modeCode：3=straight 正在执行，9=急停
-         * CH2  yaw * 10
-         * CH3  yawError * 10
-         * CH4  GyroZ * 10
-         * CH5  目标前进速度
-         * CH6  目标转向速度
-         * CH7  当前平均累计脉冲
-         * CH8  停止判断阈值脉冲
-         * CH9  左 PWM
-         * CH10 右 PWM
-         */
         Serial_Printf("[p,%d,%d,%d,%d,%d,%d,%ld,%ld,%d,%d]\r\n",
                       modeCode,
                       (int)(g_yawDeg * 10.0f),
@@ -2190,29 +2180,16 @@ static void Serial_SendPlotStatus(void)
 
     if (g_plotMode == 4U)
     {
-        /*
-         * arcTest 半圆弧测试回传格式：
-         * CH1  modeCode：4=arcTest 正在执行，9=急停
-         * CH2  yaw * 10
-         * CH3  deltaYaw * 10
-         * CH4  arcRunMs / 10
-         * CH5  lineError
-         * CH6  lineMask
-         * CH7  目标前进速度
-         * CH8  目标转向速度
-         * CH9  当前平均累计脉冲
-         * CH10 lineValid
-         */
-        Serial_Printf("[p,%d,%d,%d,%d,%d,%d,%d,%d,%ld,%d]\r\n",
+        Serial_Printf("[p,%d,%d,%d,%d,%d,%d,%ld,%ld,%d,%d]\r\n",
                       modeCode,
                       (int)(g_yawDeg * 10.0f),
                       (int)(g_arcDeltaYaw * 10.0f),
                       (int)(g_arcRunMs / 10U),
                       (int)g_lineError,
                       (int)g_lineMask,
-                      (int)g_targetForwardSpeed,
-                      (int)g_targetTurnSpeed,
                       (long)g_forwardEncoderTotal,
+                      (long)Task2_GetWheelDiffPulse(),
+                      (int)g_targetTurnSpeed,
                       (int)g_lineValid);
         return;
     }
@@ -2246,8 +2223,8 @@ static void OLED_ShowStatus(void)
     {
         OLED_Printf(0, 0, OLED_8X16, "R:%d E:%02X ID:%02X", (int)g_mpuReady, (int)g_mpuErr, (int)g_mpuWhoAmI);
         OLED_Printf(0, 16, OLED_8X16, "C:%d N:%03d", (int)g_mpuCalibrated, (int)g_mpuInitTryCount);
-        OLED_Printf(0, 32, OLED_8X16, "Y:%+04d.%d", (int)g_yawDeg, (int)(absf_local(g_yawDeg * 10.0f)) % 10);
-        OLED_Printf(0, 48, OLED_8X16, "G:%+04d.%d B:%+03d", (int)g_gyroZDps, (int)(absf_local(g_gyroZDps * 10.0f)) % 10, (int)g_gyroZBiasDps);
+        OLED_Printf(0, 32, OLED_8X16, "Y:%+04d", (int)g_yawDeg);
+        OLED_Printf(0, 48, OLED_8X16, "G:%+04d B:%+03d", (int)g_gyroZDps, (int)g_gyroZBiasDps);
         OLED_Update();
         return;
     }
@@ -2264,16 +2241,16 @@ static void OLED_ShowStatus(void)
 
     if (g_plotMode == 4U)
     {
-        OLED_Printf(0, 0, OLED_8X16, "ARC R:%04d T:%03d", (int)g_arcRunMs, (int)g_arcYawTarget);
-        OLED_Printf(0, 16, OLED_8X16, "Y:%+04d D:%+04d", (int)g_yawDeg, (int)g_arcDeltaYaw);
-        OLED_Printf(0, 32, OLED_8X16, "E:%+04d M:%02X", (int)g_lineError, (int)g_lineMask);
-        OLED_Printf(0, 48, OLED_8X16, "F:%+03d T:%+03d", (int)g_targetForwardSpeed, (int)g_targetTurnSpeed);
+        OLED_Printf(0, 0, OLED_8X16, "T2 S:%02d R:%04d", (int)g_taskState, (int)g_arcRunMs);
+        OLED_Printf(0, 16, OLED_8X16, "E:%+04d M:%02X", (int)g_lineError, (int)g_lineMask);
+        OLED_Printf(0, 32, OLED_8X16, "F:%+05ld", (long)g_forwardEncoderTotal);
+        OLED_Printf(0, 48, OLED_8X16, "D:%+05ld V:%d", (long)Task2_GetWheelDiffPulse(), (int)g_lineValid);
         OLED_Update();
         return;
     }
 
-    OLED_Printf(0, 0, OLED_8X16, "M:%s LK:%d RP:%03d", ModeString(), (int)g_safetyLocked, (int)g_btSpeedLimitPercent);
-    OLED_Printf(0, 16, OLED_8X16, "T:%+04d V:%+04d", (int)g_targetForwardSpeed, (int)g_forwardSpeed);
+    OLED_Printf(0, 0, OLED_8X16, "M:%s T:%d RP:%03d", ModeString(), (int)g_taskSelected, (int)g_btSpeedLimitPercent);
+    OLED_Printf(0, 16, OLED_8X16, "LK:%d S:%02d", (int)g_safetyLocked, (int)g_taskState);
     OLED_Printf(0, 32, OLED_8X16, "L:%+04d R:%+04d", (int)g_leftPwm, (int)g_rightPwm);
     OLED_Printf(0, 48, OLED_8X16, "R:%02X M:%02X E:%+03d", (int)g_lineRawMask, (int)g_lineMask, (int)(g_lineError / 10));
     OLED_Update();
@@ -2281,77 +2258,43 @@ static void OLED_ShowStatus(void)
 
 static void Main_KeyProcess(void)
 {
-    uint8_t key;
+    uint8_t key = Key_GetNum();
+    if (key == 0U) return;
 
-    key = Key_GetNum();
-    if (key == 0U)
-    {
-        return;
-    }
-
+    /*
+     * 实体按键功能：
+     *   K1：本地模式循环：待机 -> 编码器调试 -> MPU 调试 -> 待机。
+     *   K2：任务选择循环：task1 -> task2 -> task3 -> task4。
+     *   K3：待机执行当前任务；编码器调试清零脉冲；MPU 调试清零 yaw。
+     *   K4：解锁小车，PWM 清零，回到待机。
+     */
     if (key == 1U)
     {
-        ApplySpeedLimitPercent(0.0f);
-        g_straightActive = 0;
-        g_arcActive = 0;
-        Task_Reset();
-        Control_ForcePWMZero();
-        Prompt_Start(160);
+        Local_CycleMode();
         return;
     }
 
     if (key == 2U)
     {
-        if (g_straightActive || g_arcActive || g_taskRunning)
-        {
-            Task_Stop();
-            return;
-        }
-
-        if (g_safetyLocked)
-        {
-            Prompt_Start(80);
-            return;
-        }
-
-        /*
-         * K2/SW2 为编码器调试模式切换键：
-         *   开机默认 g_plotMode=0，即普通 BT 显示/回传模式；
-         *   第一次按 K2：切换到编码器调试显示/回传模式，并清零累计脉冲；
-         *   再按一次 K2：返回普通 BT 显示/回传模式。
-         * 注意：编码器调试模式本质上仍保持 WORK_BT，便于用网页摇杆低速行驶做标定。
-         */
-        if (g_plotMode == 0U)
-        {
-            g_workMode = WORK_BT;
-            g_plotMode = 1U;
-            g_lastCmdTickMs = 0;
-            Control_ForcePWMZero();
-            Encoder_DebugClearTotals();
-        }
-        else
-        {
-            g_plotMode = 0U;
-            App_StartBluetoothMode();
-        }
+        Local_SelectNextTask();
         return;
     }
 
     if (key == 3U)
     {
-        ApplyFastPreset();
+        Local_ExecuteSelectedTask();
         return;
     }
 
     if (key == 4U)
     {
-        Encoder_DebugClearTotals();
+        App_UnlockControl();
         return;
     }
 }
 
 /* ================================================================
- * 13. 主函数和 1ms 定时中断
+ * 18. 主函数和 1ms 定时中断
  * ================================================================ */
 
 int main(void)
@@ -2362,13 +2305,10 @@ int main(void)
     Motor_Init();
     Encoder_Init();
 
-    /* 先强制配置灰度接口，再初始化 PB1/PB5 声光提示输出。 */
     Line_GPIOForceInit();
     PromptIO_Init();
 
-    /* OLED 已经初始化，PB8/PB9 总线可用，此时初始化 MPU6050。 */
     MPU_AppInit();
-
     Serial_Init();
     Timer_Init();
     Control_Init();
@@ -2376,10 +2316,10 @@ int main(void)
     ApplySpeedLimitPercent(g_btSpeedLimitPercent);
     PromptIO_AllOff();
 
-    OLED_Printf(0, 0, OLED_8X16, "BT/Trace Car");
-    OLED_Printf(0, 16, OLED_8X16, "Default: BT");
-    OLED_Printf(0, 32, OLED_8X16, "RP:%d%%", (int)g_btSpeedLimitPercent);
-    OLED_Printf(0, 48, OLED_8X16, "Ready");
+    OLED_Printf(0, 0, OLED_8X16, "Local Standby");
+    OLED_Printf(0, 16, OLED_8X16, "K1Mode K2Task");
+    OLED_Printf(0, 32, OLED_8X16, "K3Run  K4Unlock");
+    OLED_Printf(0, 48, OLED_8X16, "Task:%d", (int)g_taskSelected);
     OLED_Update();
 
     while (1)
@@ -2389,11 +2329,8 @@ int main(void)
 
         if (g_mpuUpdateMs >= MPU_UPDATE_PERIOD_MS)
         {
-            uint16_t elapsedMs;
-
-            elapsedMs = g_mpuUpdateMs;
+            uint16_t elapsedMs = g_mpuUpdateMs;
             g_mpuUpdateMs = 0;
-
             MPU_UpdateYaw(elapsedMs);
         }
 
@@ -2422,23 +2359,10 @@ void TIM1_UP_IRQHandler(void)
         Key_Tick();
         Prompt_Tick1ms();
 
-        if (g_lastCmdTickMs < 60000U)
-        {
-            g_lastCmdTickMs++;
-        }
-
-        if (g_oledRefreshMs < 60000U)
-        {
-            g_oledRefreshMs++;
-        }
-        if (g_plotReportMs < 60000U)
-        {
-            g_plotReportMs++;
-        }
-        if (g_mpuUpdateMs < 60000U)
-        {
-            g_mpuUpdateMs++;
-        }
+        if (g_lastCmdTickMs < 60000U) g_lastCmdTickMs++;
+        if (g_oledRefreshMs < 60000U) g_oledRefreshMs++;
+        if (g_plotReportMs < 60000U) g_plotReportMs++;
+        if (g_mpuUpdateMs < 60000U) g_mpuUpdateMs++;
 
         controlDiv++;
         if (controlDiv >= CONTROL_PERIOD_MS)
