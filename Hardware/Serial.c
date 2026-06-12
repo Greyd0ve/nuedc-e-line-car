@@ -11,6 +11,7 @@
 #include "stm32f10x.h"                  // Device header
 #include <stdio.h>
 #include <stdarg.h>
+#include <stdint.h>
 
 uint8_t Serial_RxData;		//定义串口接收的数据变量
 uint8_t Serial_RxFlag;		//定义串口接收的标志位变量
@@ -158,8 +159,9 @@ void Serial_Printf(char *format, ...)
 	char String[100];				//定义字符数组
 	va_list arg;					//定义可变参数列表数据类型的变量arg
 	va_start(arg, format);			//从format开始，接收参数列表到arg变量
-	vsprintf(String, format, arg);	//使用vsprintf打印格式化字符串和参数列表到字符数组中
+	vsnprintf(String, sizeof(String), format, arg);	//限制长度，避免格式化输出越界
 	va_end(arg);					//结束变量arg
+	String[sizeof(String) - 1U] = '\0';
 	Serial_SendString(String);		//串口发送字符数组（字符串）
 }
 
@@ -193,13 +195,20 @@ uint8_t Serial_GetRxData(void)
 static volatile uint8_t  Serial_RxBuf[SERIAL_RX_BUF_SIZE];
 static volatile uint16_t Serial_RxW = 0;
 static volatile uint16_t Serial_RxR = 0;
+static volatile uint32_t Serial_RxOverflowCount = 0;
 
 uint8_t Serial_ReadByte(uint8_t *byte)
 {
+	if (byte == 0) return 0;
 	if (Serial_RxR == Serial_RxW) return 0;
 	*byte = Serial_RxBuf[Serial_RxR];
 	Serial_RxR = (Serial_RxR + 1) % SERIAL_RX_BUF_SIZE;
 	return 1;
+}
+
+uint32_t Serial_GetRxOverflowCount(void)
+{
+	return Serial_RxOverflowCount;
 }
 
 
@@ -221,6 +230,9 @@ void USART1_IRQHandler(void)
 			Serial_RxBuf[Serial_RxW] = b;
 			Serial_RxW = next;
 		}
+		else
+		{
+			Serial_RxOverflowCount++;
+		}
 	}
 }
-

@@ -42,10 +42,32 @@ extern volatile float g_speedScale;
 extern volatile float g_btSpeedLimitPercent;
 extern volatile uint8_t g_safetyLocked;
 
+extern volatile uint32_t g_protoPacketOkCount;
+extern volatile uint32_t g_protoErrFieldCount;
+extern volatile uint32_t g_protoErrUnknownCount;
+extern volatile uint32_t g_protoErrBadIntCount;
+extern volatile uint32_t g_protoErrBadFloatCount;
+extern volatile uint32_t g_protoErrRangeCount;
+extern volatile uint32_t g_protoErrTooLongCount;
+
 extern void App_StartTracingMode(void);
 extern void App_StartBluetoothMode(void);
 extern void App_EmergencyStop(void);
 extern void App_UnlockControl(void);
+
+#define BT_PROTO_RESULT_ERROR      0U
+#define BT_PROTO_RESULT_OK         1U
+#define BT_PROTO_RESULT_IGNORED    2U
+
+typedef enum
+{
+    BT_PROTO_ERR_FIELD = 0,
+    BT_PROTO_ERR_UNKNOWN,
+    BT_PROTO_ERR_BAD_INT,
+    BT_PROTO_ERR_BAD_FLOAT,
+    BT_PROTO_ERR_RANGE,
+    BT_PROTO_ERR_TOO_LONG
+} BT_ProtocolError_t;
 
 static float absf_local(float x)
 {
@@ -118,6 +140,125 @@ static float clip_float(float x, float minVal, float maxVal)
     return x;
 }
 
+static const char *bt_proto_skip_space(const char *s)
+{
+    while (*s == ' ' || *s == '\t')
+    {
+        s++;
+    }
+    return s;
+}
+
+static void BT_RecordError(BT_ProtocolError_t err, const char *reason, uint8_t report)
+{
+    if (err == BT_PROTO_ERR_FIELD) g_protoErrFieldCount++;
+    else if (err == BT_PROTO_ERR_UNKNOWN) g_protoErrUnknownCount++;
+    else if (err == BT_PROTO_ERR_BAD_INT) g_protoErrBadIntCount++;
+    else if (err == BT_PROTO_ERR_BAD_FLOAT) g_protoErrBadFloatCount++;
+    else if (err == BT_PROTO_ERR_RANGE) g_protoErrRangeCount++;
+    else if (err == BT_PROTO_ERR_TOO_LONG) g_protoErrTooLongCount++;
+
+    if (report)
+    {
+        Serial_Printf("[status,err,%s]\r\n", reason);
+    }
+}
+
+static uint8_t BT_ResultOk(uint8_t report)
+{
+    g_protoPacketOkCount++;
+    if (report)
+    {
+        Serial_Printf("[status,ok]\r\n");
+    }
+    return BT_PROTO_RESULT_OK;
+}
+
+static uint8_t BT_ParseFloat(const char *text, float *out)
+{
+    const char *p;
+    char *endPtr;
+    double value;
+
+    if (text == 0 || out == 0) return 0;
+
+    p = bt_proto_skip_space(text);
+    if (*p == '\0') return 0;
+
+    value = strtod(p, &endPtr);
+    if (endPtr == p) return 0;
+
+    endPtr = (char *)bt_proto_skip_space(endPtr);
+    if (*endPtr != '\0') return 0;
+    if (value != value) return 0;
+    if (value > 1.0e30 || value < -1.0e30) return 0;
+
+    *out = (float)value;
+    return 1;
+}
+
+static uint8_t BT_ParseInt(const char *text, int *out)
+{
+    const char *p;
+    char *endPtr;
+    long value;
+
+    if (text == 0 || out == 0) return 0;
+
+    p = bt_proto_skip_space(text);
+    if (*p == '\0') return 0;
+
+    value = strtol(p, &endPtr, 10);
+    if (endPtr == p) return 0;
+
+    endPtr = (char *)bt_proto_skip_space(endPtr);
+    if (*endPtr != '\0') return 0;
+    if (value > 32767L || value < -32768L) return 0;
+
+    *out = (int)value;
+    return 1;
+}
+
+static uint8_t BT_ReadIntRange(const char *text, int minVal, int maxVal, int *out)
+{
+    int value;
+
+    if (!BT_ParseInt(text, &value))
+    {
+        BT_RecordError(BT_PROTO_ERR_BAD_INT, "bad-number", 1U);
+        return 0;
+    }
+
+    if (value < minVal || value > maxVal)
+    {
+        BT_RecordError(BT_PROTO_ERR_RANGE, "range", 1U);
+        return 0;
+    }
+
+    *out = value;
+    return 1;
+}
+
+static uint8_t BT_ReadFloatRange(const char *text, float minVal, float maxVal, float *out)
+{
+    float value;
+
+    if (!BT_ParseFloat(text, &value))
+    {
+        BT_RecordError(BT_PROTO_ERR_BAD_FLOAT, "bad-number", 1U);
+        return 0;
+    }
+
+    if (value < minVal || value > maxVal)
+    {
+        BT_RecordError(BT_PROTO_ERR_RANGE, "range", 1U);
+        return 0;
+    }
+
+    *out = value;
+    return 1;
+}
+
 /*
  * 通过蓝牙串口虚拟滑杆 RP 设置最高速度/PWM 限幅。
  * 协议示例：
@@ -148,7 +289,7 @@ static float slider_to_command(int value, float maxAbs)
     return (float)value;
 }
 
-static void apply_packet(char *payload)
+static uint8_t apply_packet(char *payload)
 {
     char *tok[10] = {0};
     int n = 0;
@@ -167,7 +308,8 @@ static void apply_packet(char *payload)
 
     if (n <= 0 || tok[0][0] == '\0')
     {
-        return;
+        BT_RecordError(BT_PROTO_ERR_FIELD, "field", 1U);
+        return BT_PROTO_RESULT_ERROR;
     }
 
     /*
@@ -189,13 +331,13 @@ static void apply_packet(char *payload)
             if (isDown && str_is_emergency_name(tok[1]))
             {
                 App_EmergencyStop();
-                return;
+                return BT_ResultOk(1U);
             }
 
             if (isDown && str_is_unlock_name(tok[1]))
             {
                 App_UnlockControl();
-                return;
+                return BT_ResultOk(1U);
             }
         }
     }
@@ -218,11 +360,11 @@ static void apply_packet(char *payload)
 
             if (g_safetyLocked)
             {
-                return;
+                return BT_PROTO_RESULT_IGNORED;
             }
 
-            forward = atoi(tok[2]);
-            turn = atoi(tok[3]);
+            if (!BT_ReadIntRange(tok[2], -100, 100, &forward)) return BT_PROTO_RESULT_ERROR;
+            if (!BT_ReadIntRange(tok[3], -100, 100, &turn)) return BT_PROTO_RESULT_ERROR;
 
             g_targetForwardSpeed = clip_float(forward * g_maxForwardCmd / 100.0f,
                                               -g_maxForwardCmd,
@@ -233,8 +375,10 @@ static void apply_packet(char *payload)
                                            g_maxTurnCmd);
 
             g_carEnable = 1;
-            return;
+            return BT_ResultOk(0U);
         }
+        BT_RecordError(BT_PROTO_ERR_FIELD, "field", 1U);
+        return BT_PROTO_RESULT_ERROR;
     }
 
     /*
@@ -251,70 +395,108 @@ static void apply_packet(char *payload)
     {
         if (n >= 3)
         {
-            int value = atoi(tok[2]);
+            int value;
             int id;
+            float cmd;
 
             if (str_is_rp_name(tok[1]))
             {
+                if (!BT_ReadIntRange(tok[2], 0, 100, &value)) return BT_PROTO_RESULT_ERROR;
                 BT_ApplySpeedLimitPercent(value);
-                return;
+                return BT_ResultOk(1U);
             }
 
             if (g_safetyLocked)
             {
-                return;
+                return BT_PROTO_RESULT_IGNORED;
             }
 
-            id = atoi(tok[1]);
+            if (!BT_ReadIntRange(tok[2], -300, 300, &value)) return BT_PROTO_RESULT_ERROR;
+            if (!BT_ReadIntRange(tok[1], 1, 10, &id)) return BT_PROTO_RESULT_ERROR;
 
             if (id == 1)
             {
-                g_targetForwardSpeed = clip_float(slider_to_command(value, g_maxForwardCmd),
-                                                  -g_maxForwardCmd,
-                                                  g_maxForwardCmd);
+                cmd = slider_to_command(value, g_maxForwardCmd);
+                if (cmd < -g_maxForwardCmd || cmd > g_maxForwardCmd)
+                {
+                    BT_RecordError(BT_PROTO_ERR_RANGE, "range", 1U);
+                    return BT_PROTO_RESULT_ERROR;
+                }
+                g_targetForwardSpeed = cmd;
                 g_carEnable = 1;
             }
             else if (id == 2)
             {
-                g_targetTurnSpeed = clip_float(slider_to_command(value, g_maxTurnCmd),
-                                               -g_maxTurnCmd,
-                                               g_maxTurnCmd);
+                cmd = slider_to_command(value, g_maxTurnCmd);
+                if (cmd < -g_maxTurnCmd || cmd > g_maxTurnCmd)
+                {
+                    BT_RecordError(BT_PROTO_ERR_RANGE, "range", 1U);
+                    return BT_PROTO_RESULT_ERROR;
+                }
+                g_targetTurnSpeed = cmd;
                 g_carEnable = 1;
             }
             else if (id == 3)
             {
-                g_forwardKp = clip_float(absf_local((float)value) / 10.0f, 0.0f, 50.0f);
+                g_forwardKp = absf_local((float)value) / 10.0f;
             }
             else if (id == 4)
             {
-                g_forwardKi = clip_float(absf_local((float)value) / 100.0f, 0.0f, 20.0f);
+                g_forwardKi = absf_local((float)value) / 100.0f;
             }
             else if (id == 5)
             {
-                g_forwardKd = clip_float(absf_local((float)value) / 10.0f, 0.0f, 20.0f);
+                if (absf_local((float)value) > 200.0f)
+                {
+                    BT_RecordError(BT_PROTO_ERR_RANGE, "range", 1U);
+                    return BT_PROTO_RESULT_ERROR;
+                }
+                g_forwardKd = absf_local((float)value) / 10.0f;
             }
             else if (id == 6)
             {
-                g_turnKp = clip_float(absf_local((float)value) / 10.0f, 0.0f, 50.0f);
+                g_turnKp = absf_local((float)value) / 10.0f;
             }
             else if (id == 7)
             {
-                g_turnKi = clip_float(absf_local((float)value) / 100.0f, 0.0f, 20.0f);
+                g_turnKi = absf_local((float)value) / 100.0f;
             }
             else if (id == 8)
             {
-                g_turnKd = clip_float(absf_local((float)value) / 10.0f, 0.0f, 20.0f);
+                if (absf_local((float)value) > 200.0f)
+                {
+                    BT_RecordError(BT_PROTO_ERR_RANGE, "range", 1U);
+                    return BT_PROTO_RESULT_ERROR;
+                }
+                g_turnKd = absf_local((float)value) / 10.0f;
             }
             else if (id == 9)
             {
-                g_maxForwardCmd = clip_float(absf_local((float)value), 10.0f, 300.0f);
+                if (absf_local((float)value) < 10.0f)
+                {
+                    BT_RecordError(BT_PROTO_ERR_RANGE, "range", 1U);
+                    return BT_PROTO_RESULT_ERROR;
+                }
+                g_maxForwardCmd = absf_local((float)value);
             }
             else if (id == 10)
             {
-                g_maxTurnCmd = clip_float(absf_local((float)value), 10.0f, 300.0f);
+                if (absf_local((float)value) < 10.0f)
+                {
+                    BT_RecordError(BT_PROTO_ERR_RANGE, "range", 1U);
+                    return BT_PROTO_RESULT_ERROR;
+                }
+                g_maxTurnCmd = absf_local((float)value);
             }
-            return;
+            else
+            {
+                BT_RecordError(BT_PROTO_ERR_UNKNOWN, "unknown", 1U);
+                return BT_PROTO_RESULT_ERROR;
+            }
+            return BT_ResultOk(1U);
         }
+        BT_RecordError(BT_PROTO_ERR_FIELD, "field", 1U);
+        return BT_PROTO_RESULT_ERROR;
     }
 
     /*
@@ -329,16 +511,24 @@ static void apply_packet(char *payload)
     {
         if (g_safetyLocked)
         {
-            return;
+            return BT_PROTO_RESULT_IGNORED;
         }
 
         if (n >= 3)
         {
-            g_targetForwardSpeed = clip_float((float)atof(tok[1]), -g_maxForwardCmd, g_maxForwardCmd);
-            g_targetTurnSpeed = clip_float((float)atof(tok[2]), -g_maxTurnCmd, g_maxTurnCmd);
+            float forward;
+            float turn;
+
+            if (!BT_ReadFloatRange(tok[1], -g_maxForwardCmd, g_maxForwardCmd, &forward)) return BT_PROTO_RESULT_ERROR;
+            if (!BT_ReadFloatRange(tok[2], -g_maxTurnCmd, g_maxTurnCmd, &turn)) return BT_PROTO_RESULT_ERROR;
+
+            g_targetForwardSpeed = forward;
+            g_targetTurnSpeed = turn;
             g_carEnable = 1;
-            return;
+            return BT_ResultOk(1U);
         }
+        BT_RecordError(BT_PROTO_ERR_FIELD, "field", 1U);
+        return BT_PROTO_RESULT_ERROR;
     }
 
     /*
@@ -358,24 +548,29 @@ static void apply_packet(char *payload)
             int id;
             int isDown = str_equal(tok[2], "d") || str_equal(tok[2], "down");
 
+            if (!isDown)
+            {
+                return BT_PROTO_RESULT_IGNORED;
+            }
+
             if (g_safetyLocked)
             {
-                return;
+                return BT_PROTO_RESULT_IGNORED;
             }
 
             if (isDown && str_is_tracing_name(tok[1]))
             {
                 App_StartTracingMode();
-                return;
+                return BT_ResultOk(1U);
             }
 
             if (isDown && str_is_bluetooth_name(tok[1]))
             {
                 App_StartBluetoothMode();
-                return;
+                return BT_ResultOk(1U);
             }
 
-            id = atoi(tok[1]);
+            if (!BT_ReadIntRange(tok[1], 1, 4, &id)) return BT_PROTO_RESULT_ERROR;
 
             if (id == 1 && isDown)
             {
@@ -398,9 +593,14 @@ static void apply_packet(char *payload)
                 g_targetTurnSpeed = 0.0f;
                 g_carEnable = 0;
             }
-            return;
+            return BT_ResultOk(1U);
         }
+        BT_RecordError(BT_PROTO_ERR_FIELD, "field", 1U);
+        return BT_PROTO_RESULT_ERROR;
     }
+
+    BT_RecordError(BT_PROTO_ERR_UNKNOWN, "unknown", 1U);
+    return BT_PROTO_RESULT_ERROR;
 }
 
 /* 从串口环形缓冲区取字节，提取 [ ... ] 包后交给 BT_ParsePacket。 */
@@ -411,6 +611,7 @@ void BT_Process(void)
     static char packet[96];
     uint8_t byte;
     uint8_t gotPacket = 0;
+    uint8_t result;
 
     while (Serial_ReadByte(&byte))
     {
@@ -449,12 +650,16 @@ void BT_Process(void)
         {
             receiving = 0;
             index = 0;
+            BT_RecordError(BT_PROTO_ERR_TOO_LONG, "too-long", 1U);
         }
     }
 
     if (gotPacket)
     {
-        apply_packet(packet);
-        g_lastCmdTickMs = 0;
+        result = apply_packet(packet);
+        if (result == BT_PROTO_RESULT_OK)
+        {
+            g_lastCmdTickMs = 0;
+        }
     }
 }

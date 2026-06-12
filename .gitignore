@@ -1,19 +1,24 @@
-# 默认忽略所有文件
+# Ignore everything by default.
 *
 
-# 允许文件夹本身被 Git 进入
+# Keep source directories visible to Git.
 !Hardware/
 !User/
 !System/
+!Control/
+!App/
 
-# 允许上传 Hardware 全部文件
+# Track all Hardware and System sources.
 !Hardware/**
-
-# 只允许上传 User/main.c
-!User/main.c
-
-# 允许上传 System 全部文件
 !System/**
 
-# 允许上传 .gitignore 自己
+# Track the control module introduced by staged refactors.
+!Control/**
+!App/**
+
+# Track the current application entry.
+!User/main.c
+
+# Track this ignore file.
 !.gitignore
+!AGENTS.md

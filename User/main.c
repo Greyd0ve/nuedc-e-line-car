@@ -72,10 +72,12 @@
 #include "Grayscale.h"
 #include "PWM.h"
 #include "MPU6050.h"
+#include "../App/app_control.h"
+#include "../App/app_line.h"
+#include "../App/app_protocol.h"
+#include "../App/app_state.h"
 #include <stdio.h>
 #include <stdint.h>
-#include <stdlib.h>
-#include <string.h>
 
 #ifndef GRAYSCALE_CHANNELS
 #define GRAYSCALE_CHANNELS 8U
@@ -91,7 +93,6 @@
 #define OLED_REFRESH_PERIOD_MS         100U
 #define MPU_UPDATE_PERIOD_MS           10U
 
-#define PWM_LIMIT_MIN                  0.0f
 #define PWM_LIMIT_MAX                  ((float)PWM_MAX_DUTY)
 
 /* MPU6050 静止校准参数。当前先保持原方案，后续可再加长采样。 */
@@ -136,20 +137,6 @@ volatile float g_turnSlewStep = 14.0f;
  * 3. 速度环和转向环 PID 参数
  * ================================================================ */
 
-typedef struct
-{
-    float Kp;
-    float Ki;
-    float Kd;
-    float Integral;
-    float LastError;
-    float OutputLimit;
-    float IntegralLimit;
-} PID_TypeDef;
-
-static PID_TypeDef ForwardPID;
-static PID_TypeDef TurnPID;
-
 volatile float g_forwardKp = 14.0f;
 volatile float g_forwardKi = 0.55f;
 volatile float g_forwardKd = 1.8f;
@@ -161,28 +148,6 @@ volatile float g_turnKd = 1.0f;
 volatile float g_maxForwardCmd = 70.0f;
 volatile float g_maxTurnCmd = 75.0f;
 
-/* ================================================================
- * 4. 运行状态变量
- * ================================================================ */
-
-typedef enum
-{
-    /* 本地待机：上电默认状态，不响应摇杆遥控，PWM 保持清零。 */
-    WORK_STANDBY = 0,
-
-    /* 蓝牙遥控：只由网页 [key,Bluetooth,down] 进入。 */
-    WORK_BT = 1,
-
-    /* 普通八路灰度循迹：由网页 [key,tracing,down] 进入。 */
-    WORK_TRACING = 2
-} WorkMode_t;
-
-typedef enum
-{
-    LOCAL_STANDBY = 0,
-    LOCAL_ENCODER_DEBUG = 1,
-    LOCAL_MPU_DEBUG = 2
-} LocalMode_t;
 
 typedef enum
 {
@@ -232,6 +197,7 @@ volatile int32_t g_forwardEncoderTotal = 0;
 volatile int32_t g_turnEncoderTotal = 0;
 
 /* 0=普通回传，1=编码器调试，2=MPU调试，3=直线调试，4=弧线/task2调试 */
+/* Plot modes: 0=legacy [p] normal, 1=encoder, 2=MPU, 3=straight, 4=arc/task2, 5=web PID [plot]. */
 volatile uint8_t g_plotMode = 0;
 
 volatile float g_speedPwm = 0.0f;
@@ -244,6 +210,15 @@ volatile float g_forwardSpeedError = 0.0f;
 volatile uint8_t g_sendPlot = 0;
 volatile uint16_t g_sendDisplay = 0;
 
+volatile uint32_t g_protoPacketOkCount = 0;
+volatile uint32_t g_protoErrFieldCount = 0;
+volatile uint32_t g_protoErrUnknownCount = 0;
+volatile uint32_t g_protoErrBadIntCount = 0;
+volatile uint32_t g_protoErrBadFloatCount = 0;
+volatile uint32_t g_protoErrRangeCount = 0;
+volatile uint32_t g_protoErrTooLongCount = 0;
+volatile uint32_t g_protoErrLockedCount = 0;
+
 volatile uint16_t g_oledRefreshMs = 0;
 volatile uint16_t g_plotReportMs = 0;
 volatile uint16_t g_mpuUpdateMs = 0;
@@ -254,9 +229,6 @@ volatile uint8_t g_lineMask = 0;
 volatile uint8_t g_lineRawMask = 0;
 volatile int8_t g_lastLineDir = 1;
 volatile uint16_t g_lineLostMs = 0;
-
-static volatile float g_lineErrorFiltered = 0.0f;
-static volatile float g_lineLastCtrlError = 0.0f;
 static volatile uint16_t g_promptMs = 0;
 
 /* MPU6050 yaw 调试状态。 */
@@ -358,9 +330,6 @@ volatile uint16_t g_task2AlignWaitTargetMs = 500U;
  * 6. 前向声明
  * ================================================================ */
 
-static void Line_Update(void);
-static float Line_CalcTurnCmd(void);
-static void Tracing_Control10ms(void);
 static void Task2_SearchArcStart(float turnSign);
 static uint8_t Task2_IsSpecialState(void);
 static void Task2_Control10ms(void);
@@ -391,13 +360,6 @@ static float limit_float(float value, float minVal, float maxVal)
     return value;
 }
 
-static int16_t limit_i16(int32_t value, int16_t minVal, int16_t maxVal)
-{
-    if (value < minVal) return minVal;
-    if (value > maxVal) return maxVal;
-    return (int16_t)value;
-}
-
 static float slew_float(float current, float target, float maxStep)
 {
     if (maxStep <= 0.0f) return target;
@@ -424,36 +386,6 @@ static void Main_DelayMs(uint16_t ms)
             __NOP();
         }
     }
-}
-
-static char ascii_lower_char(char c)
-{
-    if (c >= 'A' && c <= 'Z') return (char)(c + ('a' - 'A'));
-    return c;
-}
-
-static int str_equal_ignore_case(const char *a, const char *b)
-{
-    while (*a != '\0' && *b != '\0')
-    {
-        if (ascii_lower_char(*a) != ascii_lower_char(*b)) return 0;
-        a++;
-        b++;
-    }
-    return (*a == '\0' && *b == '\0');
-}
-
-static int str_is_down(const char *s)
-{
-    return str_equal_ignore_case(s, "down") || str_equal_ignore_case(s, "d");
-}
-
-static int str_is_name(const char *s, const char *a, const char *b, const char *c)
-{
-    if (str_equal_ignore_case(s, a)) return 1;
-    if (b && str_equal_ignore_case(s, b)) return 1;
-    if (c && str_equal_ignore_case(s, c)) return 1;
-    return 0;
 }
 
 /* ================================================================
@@ -515,84 +447,9 @@ static void PromptIO_Init(void)
  * 9. PID、停车控制、编码器清零
  * ================================================================ */
 
-static void PID_Reset(PID_TypeDef *pid)
-{
-    pid->Integral = 0.0f;
-    pid->LastError = 0.0f;
-}
-
-static float PID_Calc(PID_TypeDef *pid, float target, float measure)
-{
-    float error = target - measure;
-    float derivative = error - pid->LastError;
-    float integralCandidate = pid->Integral + error;
-    float output;
-
-    integralCandidate = limit_float(integralCandidate, -pid->IntegralLimit, pid->IntegralLimit);
-    output = pid->Kp * error + pid->Ki * integralCandidate + pid->Kd * derivative;
-
-    if (output > pid->OutputLimit)
-    {
-        output = pid->OutputLimit;
-        if (error < 0.0f) pid->Integral = integralCandidate;
-    }
-    else if (output < -pid->OutputLimit)
-    {
-        output = -pid->OutputLimit;
-        if (error > 0.0f) pid->Integral = integralCandidate;
-    }
-    else
-    {
-        pid->Integral = integralCandidate;
-    }
-
-    pid->LastError = error;
-    return output;
-}
-
-static void Control_Init(void)
-{
-    ForwardPID.Kp = g_forwardKp;
-    ForwardPID.Ki = g_forwardKi;
-    ForwardPID.Kd = g_forwardKd;
-    ForwardPID.Integral = 0.0f;
-    ForwardPID.LastError = 0.0f;
-    ForwardPID.OutputLimit = (float)PWM_MAX_DUTY;
-    ForwardPID.IntegralLimit = 260.0f;
-
-    TurnPID.Kp = g_turnKp;
-    TurnPID.Ki = g_turnKi;
-    TurnPID.Kd = g_turnKd;
-    TurnPID.Integral = 0.0f;
-    TurnPID.LastError = 0.0f;
-    TurnPID.OutputLimit = (float)PWM_MAX_DUTY * 0.85f;
-    TurnPID.IntegralLimit = 220.0f;
-}
-
-static void Control_UpdatePIDParam(void)
-{
-    ForwardPID.Kp = g_forwardKp;
-    ForwardPID.Ki = g_forwardKi;
-    ForwardPID.Kd = g_forwardKd;
-    TurnPID.Kp = g_turnKp;
-    TurnPID.Ki = g_turnKi;
-    TurnPID.Kd = g_turnKd;
-}
-
 static void Control_ForcePWMZero(void)
 {
-    g_straightActive = 0;
-    g_arcActive = 0;
-    g_targetForwardSpeed = 0.0f;
-    g_targetTurnSpeed = 0.0f;
-    g_speedPwm = 0.0f;
-    g_diffPwm = 0.0f;
-    g_leftPwm = 0;
-    g_rightPwm = 0;
-    g_carEnable = 0;
-    Motor_StopAll();
-    PID_Reset(&ForwardPID);
-    PID_Reset(&TurnPID);
+    App_Control_ForcePWMZero();
 }
 
 static void Prompt_Start(uint16_t ms)
@@ -784,8 +641,7 @@ static void Straight_Start(void)
     g_straightActive = 1;
     g_lastCmdTickMs = 0;
 
-    PID_Reset(&ForwardPID);
-    PID_Reset(&TurnPID);
+    App_Control_ResetPID();
     Prompt_Start(120);
 }
 
@@ -872,214 +728,6 @@ static void Straight_Control10ms(void)
  * 12. 八路灰度循迹算法与 GPIO 直读
  * ================================================================ */
 
-#define LINE_AD0_PORT      GPIOA
-#define LINE_AD0_PIN       GPIO_Pin_8
-#define LINE_AD1_PORT      GPIOB
-#define LINE_AD1_PIN       GPIO_Pin_3
-#define LINE_AD2_PORT      GPIOB
-#define LINE_AD2_PIN       GPIO_Pin_4
-#define LINE_OUT_PORT      GPIOB
-#define LINE_OUT_PIN       GPIO_Pin_0
-
-static void Line_GPIOForceInit(void)
-{
-    GPIO_InitTypeDef GPIO_InitStructure;
-
-    RCC_APB2PeriphClockCmd(RCC_APB2Periph_AFIO, ENABLE);
-    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA | RCC_APB2Periph_GPIOB, ENABLE);
-    GPIO_PinRemapConfig(GPIO_Remap_SWJ_JTAGDisable, ENABLE);
-
-    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_Out_PP;
-    GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
-    GPIO_InitStructure.GPIO_Pin = LINE_AD0_PIN;
-    GPIO_Init(GPIOA, &GPIO_InitStructure);
-
-    GPIO_InitStructure.GPIO_Pin = LINE_AD1_PIN | LINE_AD2_PIN;
-    GPIO_Init(GPIOB, &GPIO_InitStructure);
-
-    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IPU;
-    GPIO_InitStructure.GPIO_Pin = LINE_OUT_PIN;
-    GPIO_Init(GPIOB, &GPIO_InitStructure);
-
-    GPIO_ResetBits(LINE_AD0_PORT, LINE_AD0_PIN);
-    GPIO_ResetBits(LINE_AD1_PORT, LINE_AD1_PIN);
-    GPIO_ResetBits(LINE_AD2_PORT, LINE_AD2_PIN);
-}
-
-static void Line_SelectChannelDirect(uint8_t channel)
-{
-    volatile uint16_t d;
-
-    if (channel & 0x01U) GPIO_SetBits(LINE_AD0_PORT, LINE_AD0_PIN);
-    else GPIO_ResetBits(LINE_AD0_PORT, LINE_AD0_PIN);
-
-    if (channel & 0x02U) GPIO_SetBits(LINE_AD1_PORT, LINE_AD1_PIN);
-    else GPIO_ResetBits(LINE_AD1_PORT, LINE_AD1_PIN);
-
-    if (channel & 0x04U) GPIO_SetBits(LINE_AD2_PORT, LINE_AD2_PIN);
-    else GPIO_ResetBits(LINE_AD2_PORT, LINE_AD2_PIN);
-
-    for (d = 0; d < 2000; d++) __NOP();
-}
-
-static uint8_t Line_ReadOneDirect(uint8_t channel)
-{
-    uint8_t a;
-    uint8_t b;
-    uint8_t c;
-    volatile uint16_t d;
-
-    Line_SelectChannelDirect(channel);
-    a = (uint8_t)GPIO_ReadInputDataBit(LINE_OUT_PORT, LINE_OUT_PIN);
-    for (d = 0; d < 300; d++) __NOP();
-    b = (uint8_t)GPIO_ReadInputDataBit(LINE_OUT_PORT, LINE_OUT_PIN);
-    for (d = 0; d < 300; d++) __NOP();
-    c = (uint8_t)GPIO_ReadInputDataBit(LINE_OUT_PORT, LINE_OUT_PIN);
-
-    return (uint8_t)(((uint16_t)a + (uint16_t)b + (uint16_t)c) >= 2U);
-}
-
-static void Line_ReadAllDirect(uint8_t raw[GRAYSCALE_CHANNELS])
-{
-    uint8_t i;
-    for (i = 0; i < GRAYSCALE_CHANNELS; i++) raw[i] = Line_ReadOneDirect(i);
-}
-
-static void Line_Update(void)
-{
-    uint8_t raw[GRAYSCALE_CHANNELS];
-    static const int16_t weight[GRAYSCALE_CHANNELS] = {-350, -250, -150, -50, 50, 150, 250, 350};
-    int32_t sum = 0;
-    int16_t count = 0;
-    uint8_t mask = 0;
-    uint8_t i;
-    uint8_t blackLevel;
-    uint8_t reverseOrder;
-
-    blackLevel = (g_lineBlackLevelF <= 0.5f) ? 0U : 1U;
-    reverseOrder = (g_lineReverseOrderF <= 0.5f) ? 0U : 1U;
-
-    Line_ReadAllDirect(raw);
-
-    g_lineRawMask = 0;
-    for (i = 0; i < GRAYSCALE_CHANNELS; i++)
-    {
-        if (raw[i] == blackLevel) g_lineRawMask |= (uint8_t)(1U << i);
-    }
-
-    for (i = 0; i < GRAYSCALE_CHANNELS; i++)
-    {
-        uint8_t physicalIndex;
-        uint8_t isBlack;
-
-        physicalIndex = reverseOrder ? (uint8_t)(GRAYSCALE_CHANNELS - 1U - i) : i;
-        isBlack = (raw[physicalIndex] == blackLevel) ? 1U : 0U;
-
-        if (isBlack)
-        {
-            mask |= (uint8_t)(1U << i);
-            sum += weight[i];
-            count++;
-        }
-    }
-
-    g_lineMask = mask;
-
-    if (count > 0)
-    {
-        float rawError;
-        float alpha;
-
-        g_lineValid = 1;
-        rawError = (float)(sum / count);
-        alpha = limit_float(g_lineFilterAlpha, 0.0f, 1.0f);
-        g_lineErrorFiltered = g_lineErrorFiltered * (1.0f - alpha) + rawError * alpha;
-        g_lineError = (int16_t)g_lineErrorFiltered;
-        g_lastLineDir = (g_lineError >= 0) ? 1 : -1;
-        g_lineLostMs = 0;
-    }
-    else
-    {
-        g_lineValid = 0;
-        if (g_lineLostMs < 60000U) g_lineLostMs += CONTROL_PERIOD_MS;
-    }
-}
-
-static float Line_CalcTurnCmd(void)
-{
-    float error;
-    float dError;
-    float desiredSign;
-    float turn;
-
-    error = (float)g_lineError;
-    dError = error - g_lineLastCtrlError;
-    g_lineLastCtrlError = error;
-
-    desiredSign = (((-g_lineTurnSign) * error) >= 0.0f) ? 1.0f : -1.0f;
-    turn = (-g_lineTurnSign) * (error * g_lineKp + dError * g_lineKd);
-
-    if (absf_local(error) > 70.0f && absf_local(turn) < g_lineMinTurn)
-    {
-        turn = desiredSign * g_lineMinTurn;
-    }
-
-    if ((g_lineMask & 0xC3U) != 0U)
-    {
-        turn += desiredSign * g_lineEdgeTurnExtra;
-    }
-
-    return limit_float(turn, -g_lineTurnLimit, g_lineTurnLimit);
-}
-
-static void Tracing_Control10ms(void)
-{
-    float forward;
-    float turn;
-
-    Line_Update();
-
-    if (g_speedScale <= 0.01f || g_pwmLimit <= 0.5f)
-    {
-        g_targetForwardSpeed = 0.0f;
-        g_targetTurnSpeed = 0.0f;
-        g_carEnable = 0;
-        return;
-    }
-
-    if (g_lineValid)
-    {
-        float e;
-        float slowRatio;
-        float minForward;
-
-        e = absf_local((float)g_lineError) / 350.0f;
-        if (e > 1.0f) e = 1.0f;
-
-        slowRatio = 1.0f - limit_float(g_lineSlowGain, 0.0f, 0.95f) * e;
-        if ((g_lineMask & 0xC3U) != 0U)
-        {
-            slowRatio *= limit_float(g_lineEdgeSpeedRatio, 0.05f, 1.0f);
-        }
-
-        forward = g_traceBaseSpeed * g_speedScale * slowRatio;
-        minForward = g_traceSearchSpeed * g_speedScale;
-        if (forward < minForward) forward = minForward;
-
-        turn = Line_CalcTurnCmd() * g_speedScale;
-    }
-    else
-    {
-        forward = g_traceSearchSpeed * g_speedScale;
-        turn = (-g_lineTurnSign) * (float)g_lastLineDir * g_lineLostTurn * g_speedScale;
-    }
-
-    g_targetForwardSpeed = slew_float(g_targetForwardSpeed, forward, g_forwardSlewStep);
-    g_targetTurnSpeed = slew_float(g_targetTurnSpeed, turn, g_turnSlewStep);
-    g_carEnable = 1;
-    g_lastCmdTickMs = 0;
-}
-
 /* ================================================================
  * 13. arcTest 独立测试：保留旧 yaw 结束判断
  * ================================================================ */
@@ -1109,9 +757,7 @@ static void Arc_Start(void)
     g_workMode = WORK_TRACING;
     g_plotMode = 4U;
 
-    g_lineLostMs = 0;
-    g_lineErrorFiltered = 0.0f;
-    g_lineLastCtrlError = 0.0f;
+    App_Line_ResetState();
 
     Control_ForcePWMZero();
     Encoder_ClearTotalsOnly();
@@ -1122,8 +768,7 @@ static void Arc_Start(void)
     g_lastCmdTickMs = 0;
     g_arcActive = 1;
 
-    PID_Reset(&ForwardPID);
-    PID_Reset(&TurnPID);
+    App_Control_ResetPID();
     Prompt_Start(180);
 }
 
@@ -1155,7 +800,7 @@ static void Arc_Control10ms(void)
         return;
     }
 
-    Tracing_Control10ms();
+    App_Line_TracingControl10ms();
 }
 
 /* ================================================================
@@ -1205,9 +850,7 @@ static void Task2_SearchArcStart(float turnSign)
 
     g_task2SearchStartPulse = (float)g_forwardEncoderTotal;
 
-    g_lineLostMs = 0;
-    g_lineErrorFiltered = 0.0f;
-    g_lineLastCtrlError = 0.0f;
+    App_Line_ResetState();
 
     g_carEnable = 1;
     g_lastCmdTickMs = 0;
@@ -1224,15 +867,12 @@ static void Task2_StartTraceArc(void)
     g_task2LineLostMs = 0;
     g_task2LineValidMs = 0;
 
-    g_lineLostMs = 0;
-    g_lineErrorFiltered = 0.0f;
-    g_lineLastCtrlError = 0.0f;
+    App_Line_ResetState();
 
     if (g_taskState == TASK2_SEARCH_ARC_BC) g_taskState = TASK2_TRACE_ARC_BC;
     else if (g_taskState == TASK2_SEARCH_ARC_DA) g_taskState = TASK2_TRACE_ARC_DA;
 
-    PID_Reset(&ForwardPID);
-    PID_Reset(&TurnPID);
+    App_Control_ResetPID();
     Prompt_Start(120);
 }
 
@@ -1305,7 +945,7 @@ static void Task2_ControlSearch10ms(void)
     /* SEARCH 阶段只读灰度，不调用普通循迹。
      * 因为刚从直线提前切入时还没接触黑线，丢线是正常状态。
      */
-    Line_Update();
+    App_Line_Update();
 
     if (g_lineValid)
     {
@@ -1354,7 +994,7 @@ static void Task2_TraceLineNoLost10ms(void)
 
     /*
      * 本函数只用于 task2 的半圆弧 TRACE 阶段。
-     * 外部已经调用过 Line_Update()。
+     * 外部已经调用过 App_Line_Update()。
      * 如果 lineValid=0，绝不执行普通循迹里的 lostTurn 找线逻辑，
      * 只停车等待状态机进入 WAIT_ALIGN/ALIGN。
      */
@@ -1386,7 +1026,7 @@ static void Task2_TraceLineNoLost10ms(void)
         forward = minForward;
     }
 
-    turn = Line_CalcTurnCmd() * g_speedScale;
+    turn = App_Line_CalcTurnCmd() * g_speedScale;
 
     g_targetForwardSpeed = slew_float(g_targetForwardSpeed, forward, g_forwardSlewStep);
     g_targetTurnSpeed = slew_float(g_targetTurnSpeed, turn, g_turnSlewStep);
@@ -1406,9 +1046,9 @@ static void Task2_ControlTrace10ms(void)
     /*
      * task2 半圆弧 TRACE 阶段只读取一次灰度。
      * 在线时使用 task2 专用循迹控制；
-     * 丢线时不允许进入普通 Tracing_Control10ms() 的 lostTurn 找线逻辑。
+     * 丢线时不允许进入普通 App_Line_TracingControl10ms() 的 lostTurn 找线逻辑。
      */
-    Line_Update();
+    App_Line_Update();
     forwardAbs = absf_local((float)g_forwardEncoderTotal);
 
     if (g_lineValid)
@@ -1452,8 +1092,7 @@ static void Task2_ControlWaitAlign10ms(void)
     g_targetTurnSpeed = 0.0f;
     g_carEnable = 0;
     Motor_StopAll();
-    PID_Reset(&ForwardPID);
-    PID_Reset(&TurnPID);
+    App_Control_ResetPID();
     g_lastCmdTickMs = 0;
 
     if (g_task2AlignWaitMs < 60000U - CONTROL_PERIOD_MS)
@@ -1794,333 +1433,95 @@ static void Local_ExecuteSelectedTask(void)
  * 15. 模式切换和安全锁定
  * ================================================================ */
 
-void App_EmergencyStop(void)
+
+void App_StateTaskReset(void)
 {
-    g_safetyLocked = 1;
-    g_workMode = WORK_STANDBY;
-    g_localMode = LOCAL_STANDBY;
     Task_Reset();
+}
+
+void App_StateForcePWMZero(void)
+{
     Control_ForcePWMZero();
-    Prompt_Start(500);
 }
 
-void App_UnlockControl(void)
+void App_StatePromptStart(uint16_t ms)
 {
-    g_safetyLocked = 0;
-    g_workMode = WORK_STANDBY;
-    g_localMode = LOCAL_STANDBY;
-    g_plotMode = 0U;
+    Prompt_Start(ms);
+}
+
+void App_ProtocolTaskReset(void)
+{
     Task_Reset();
-    g_lastCmdTickMs = 0;
+}
+
+void App_ProtocolForcePWMZero(void)
+{
     Control_ForcePWMZero();
-    Prompt_Start(180);
 }
 
-void App_StartBluetoothMode(void)
+void App_ProtocolPromptStart(uint16_t ms)
 {
-    if (g_safetyLocked) return;
-
-    /* 蓝牙遥控模式只保留网页入口，实体按键不会进入该模式。 */
-    g_workMode = WORK_BT;
-    g_localMode = LOCAL_STANDBY;
-    Task_Reset();
-    g_lastCmdTickMs = 0;
-    Control_ForcePWMZero();
-    Prompt_Start(160);
+    Prompt_Start(ms);
 }
 
-void App_StartTracingMode(void)
+void App_ProtocolEncoderDebugClearTotals(void)
 {
-    if (g_safetyLocked) return;
-
-    Task_Reset();
-    g_workMode = WORK_TRACING;
-    g_localMode = LOCAL_STANDBY;
-    g_lineLostMs = 0;
-    g_lineErrorFiltered = 0.0f;
-    g_lineLastCtrlError = 0.0f;
-    g_targetForwardSpeed = 0.0f;
-    g_targetTurnSpeed = 0.0f;
-    g_carEnable = 1;
-    g_lastCmdTickMs = 0;
-    Encoder_ClearAll();
-    PID_Reset(&ForwardPID);
-    PID_Reset(&TurnPID);
-    Prompt_Start(160);
+    Encoder_DebugClearTotals();
 }
 
-/* ================================================================
- * 16. 蓝牙/网页数据包解析
- * ================================================================ */
-
-static void ApplySpeedLimitPercent(float percent)
+void App_ProtocolEnterEncoderDebug(void)
 {
-    float ratio;
-    percent = limit_float(percent, 0.0f, 100.0f);
-    ratio = percent / 100.0f;
-    g_btSpeedLimitPercent = percent;
-    g_speedScale = ratio;
-    g_pwmLimit = PWM_LIMIT_MAX * ratio;
+    Local_EnterEncoderDebug();
 }
 
-static void ApplyFastPreset(void)
+void App_ProtocolEnterMpuDebug(void)
 {
-    ApplySpeedLimitPercent(55.0f);
-
-    g_traceBaseSpeed = 60.0f;
-    g_lineKp = 0.350f;
-    g_lineKd = 0.600f;
-    g_lineTurnLimit = 180.0f;
-    g_lineMinTurn = 34.0f;
-    g_lineFilterAlpha = 0.58f;
-    g_lineSlowGain = 0.88f;
-    g_lineEdgeTurnExtra = 82.0f;
-    g_lineEdgeSpeedRatio = 0.24f;
-    g_forwardSlewStep = 14.0f;
-    g_turnSlewStep = 60.0f;
-    g_lineLostTurn = 130.0f;
-
-    g_lineTurnSign = 1.0f;
-    g_lineBlackLevelF = 1.0f;
-    g_lineReverseOrderF = 0.0f;
-
-    g_lineLostMs = 0;
-    g_lineErrorFiltered = 0.0f;
-    g_lineLastCtrlError = 0.0f;
-    PID_Reset(&ForwardPID);
-    PID_Reset(&TurnPID);
-    Prompt_Start(220);
+    Local_EnterMpuDebug();
 }
 
-static void Main_ApplySliderPacket(const char *name, float value)
+void App_ProtocolMpuCalibrateGyroZ(void)
 {
-    if (str_is_name(name, "RP", "rp", "speedLimit"))
-    {
-        ApplySpeedLimitPercent(value);
-        return;
-    }
-
-    if (str_is_name(name, "speedKp", "forwardKp", "fKp")) { g_forwardKp = limit_float(value, 0.0f, 80.0f); return; }
-    if (str_is_name(name, "speedKi", "forwardKi", "fKi")) { g_forwardKi = limit_float(value, 0.0f, 20.0f); return; }
-    if (str_is_name(name, "speedKd", "forwardKd", "fKd")) { g_forwardKd = limit_float(value, 0.0f, 30.0f); return; }
-    if (str_is_name(name, "turnKp", "diffKp", "tKp")) { g_turnKp = limit_float(value, 0.0f, 80.0f); return; }
-    if (str_is_name(name, "turnKi", "diffKi", "tKi")) { g_turnKi = limit_float(value, 0.0f, 20.0f); return; }
-    if (str_is_name(name, "turnKd", "diffKd", "tKd")) { g_turnKd = limit_float(value, 0.0f, 30.0f); return; }
-    if (str_is_name(name, "maxForward", "maxSpeed", "btSpeed")) { g_maxForwardCmd = limit_float(value, 0.0f, 200.0f); return; }
-    if (str_is_name(name, "maxTurn", "btTurn", "remoteTurn")) { g_maxTurnCmd = limit_float(value, 0.0f, 200.0f); return; }
-
-    if (str_is_name(name, "traceKp", "lineKp", "lineP")) { g_lineKp = limit_float(value, 0.0f, 1.0f); return; }
-    if (str_is_name(name, "traceKd", "lineKd", "lineD")) { g_lineKd = limit_float(value, 0.0f, 1.0f); return; }
-    if (str_is_name(name, "traceSpeed", "lineSpeed", "baseSpeed")) { g_traceBaseSpeed = limit_float(value, 0.0f, 120.0f); return; }
-    if (str_is_name(name, "turnLimit", "lineTurnLimit", "traceTurnLimit")) { g_lineTurnLimit = limit_float(value, 0.0f, 180.0f); return; }
-    if (str_is_name(name, "lostTurn", "lineLostTurn", "findTurn")) { g_lineLostTurn = limit_float(value, 0.0f, 180.0f); return; }
-
-    if (str_is_name(name, "filter", "lineFilter", "alpha"))
-    {
-        if (value > 1.0f) value = value / 100.0f;
-        g_lineFilterAlpha = limit_float(value, 0.0f, 1.0f);
-        return;
-    }
-    if (str_is_name(name, "slowGain", "lineSlow", "curveSlow"))
-    {
-        if (value > 1.0f) value = value / 100.0f;
-        g_lineSlowGain = limit_float(value, 0.0f, 0.95f);
-        return;
-    }
-    if (str_is_name(name, "edgeBoost", "edgeTurn", "edgeExtra")) { g_lineEdgeTurnExtra = limit_float(value, 0.0f, 100.0f); return; }
-    if (str_is_name(name, "edgeSlow", "edgeSpeed", "edgeRatio"))
-    {
-        if (value > 1.0f) value = value / 100.0f;
-        g_lineEdgeSpeedRatio = limit_float(value, 0.05f, 1.0f);
-        return;
-    }
-    if (str_is_name(name, "minTurn", "lineMinTurn", "traceMinTurn")) { g_lineMinTurn = limit_float(value, 0.0f, 80.0f); return; }
-    if (str_is_name(name, "forwardSlew", "speedSlew", "fSlew")) { g_forwardSlewStep = limit_float(value, 0.0f, 30.0f); return; }
-    if (str_is_name(name, "turnSlew", "diffSlew", "tSlew")) { g_turnSlewStep = limit_float(value, 0.0f, 60.0f); return; }
-    if (str_is_name(name, "lineSign", "traceSign", "turnSign")) { g_lineTurnSign = (value < 0.0f) ? -1.0f : 1.0f; return; }
-    if (str_is_name(name, "blackLevel", "lineLevel", "black")) { g_lineBlackLevelF = (value <= 0.0f) ? 0.0f : 1.0f; return; }
-    if (str_is_name(name, "lineReverse", "reverseLine", "sensorReverse")) { g_lineReverseOrderF = (value <= 0.0f) ? 0.0f : 1.0f; return; }
-
-    if (str_is_name(name, "yawSign", "gyroSign", "mpuSign")) { g_mpuYawSign = (value < 0.0f) ? -1.0f : 1.0f; return; }
-    if (str_is_name(name, "yawKp", "headingKp", "straightKp")) { g_yawKp = limit_float(value, 0.0f, 20.0f); return; }
-    if (str_is_name(name, "yawKd", "headingKd", "straightKd")) { g_yawKd = limit_float(value, 0.0f, 10.0f); return; }
-    if (str_is_name(name, "straightSpeed", "straightV", "lineV")) { g_straightSpeed = limit_float(value, 0.0f, 80.0f); return; }
-
-    if (str_is_name(name, "task2SearchPulse", "searchPulse", "toArcPulse"))
-    {
-        g_task2StraightToSearchPulse = limit_float(value, 1000.0f, 15000.0f);
-        return;
-    }
-    if (str_is_name(name, "arcWheelDiff", "wheelDiff", "arcDiff"))
-    {
-        g_task2ArcWheelDiffTarget = limit_float(value, 500.0f, 8000.0f);
-        return;
-    }
-    if (str_is_name(name, "arcMinPulse", "arcForwardPulse", "arcFwdPulse"))
-    {
-        g_task2ArcMinForwardPulse = limit_float(value, 1000.0f, 15000.0f);
-        return;
-    }
-    if (str_is_name(name, "arcFoundMs", "lineFoundMs", "foundMs"))
-    {
-        g_task2LineFoundConfirmMs = (uint16_t)limit_float(value, 10.0f, 2000.0f);
-        return;
-    }
-    if (str_is_name(name, "arcLostMs", "lineLostMs", "lostMs"))
-    {
-        g_task2LineLostConfirmMs = (uint16_t)limit_float(value, 0.0f, 3000.0f);
-        return;
-    }
-    if (str_is_name(name, "alignWaitMs", "arcWaitMs", "waitAlign"))
-    {
-        g_task2AlignWaitTargetMs = (uint16_t)limit_float(value, 0.0f, 3000.0f);
-        return;
-    }
-    if (str_is_name(name, "toArcSpeed", "arcSearchSpeed", "searchArcSpeed"))
-    {
-        g_task2SearchSpeed = limit_float(value, 0.0f, 60.0f);
-        return;
-    }
-    if (str_is_name(name, "alignTurn", "alignTurnSpeed", "arcAlignTurn"))
-    {
-        g_task2AlignTurnSpeed = limit_float(value, 0.0f, 80.0f);
-        return;
-    }
-    if (str_is_name(name, "bcTurnSign", "bcSign", "arcBcSign"))
-    {
-        g_task2BcTurnSign = (value < 0.0f) ? -1.0f : 1.0f;
-        return;
-    }
-    if (str_is_name(name, "daTurnSign", "daSign", "arcDaSign"))
-    {
-        g_task2DaTurnSign = (value < 0.0f) ? -1.0f : 1.0f;
-        return;
-    }
-
-    if (str_is_name(name, "plotMode", "debugMode", "dbg"))
-    {
-        if (value < 0.5f) g_plotMode = 0U;
-        else if (value < 1.5f) g_plotMode = 1U;
-        else if (value < 2.5f) g_plotMode = 2U;
-        else if (value < 3.5f) g_plotMode = 3U;
-        else g_plotMode = 4U;
-        return;
-    }
+    MPU_CalibrateGyroZ();
 }
 
-static void Main_ApplyJoystickPacket(char **tok, int n)
+void App_ProtocolMpuResetYaw(void)
 {
-    int turnRaw;
-    int forwardRaw;
-    float maxForward;
-    float maxTurn;
-
-    if (n < 3) return;
-    if (g_safetyLocked || g_straightActive || g_arcActive || g_taskRunning || Task2_IsSpecialState() || g_workMode != WORK_BT) return;
-
-    turnRaw = atoi(tok[1]);
-    forwardRaw = atoi(tok[2]);
-
-    maxForward = g_maxForwardCmd * g_speedScale;
-    maxTurn = g_maxTurnCmd * g_speedScale;
-
-    g_targetForwardSpeed = limit_float((float)forwardRaw * maxForward / 100.0f, -maxForward, maxForward);
-    g_targetTurnSpeed = limit_float((float)(-turnRaw) * maxTurn / 100.0f, -maxTurn, maxTurn);
-    g_carEnable = 1;
+    MPU_ResetYaw();
 }
 
-static void Main_ApplyPacket(char *payload)
+void App_ProtocolSelectTask1(void)
 {
-    char *tok[12];
-    int n;
-    char *p;
-
-    n = 0;
-    p = payload;
-    tok[n++] = p;
-    while (*p != '\0' && n < 12)
-    {
-        if (*p == ',')
-        {
-            *p = '\0';
-            tok[n++] = p + 1;
-        }
-        p++;
-    }
-
-    if (n <= 0 || tok[0][0] == '\0') return;
-
-    if (str_is_name(tok[0], "key", "k", 0))
-    {
-        if (n >= 3 && str_is_down(tok[2]))
-        {
-            if (str_is_name(tok[1], "emergency", "emg", "stop")) { App_EmergencyStop(); return; }
-            if (str_is_name(tok[1], "unlock", "release", "resume")) { App_UnlockControl(); return; }
-            if (str_is_name(tok[1], "presetFast", "fast", "fastPreset")) { ApplyFastPreset(); return; }
-            if (str_is_name(tok[1], "encClear", "encoderClear", "clearEnc")) { Encoder_DebugClearTotals(); return; }
-            if (str_is_name(tok[1], "encDebug", "encoderDebug", "encDbg")) { Local_EnterEncoderDebug(); return; }
-            if (str_is_name(tok[1], "mpuDebug", "gyroDebug", "yawDebug")) { Local_EnterMpuDebug(); return; }
-            if (str_is_name(tok[1], "mpuCalib", "gyroCalib", "calib")) { g_plotMode = 2U; MPU_CalibrateGyroZ(); return; }
-            if (str_is_name(tok[1], "yawZero", "mpuZero", "zeroYaw")) { MPU_ResetYaw(); Prompt_Start(180); return; }
-            if (str_is_name(tok[1], "task1", "selectTask1", "t1")) { Task_SelectTask1(); return; }
-            if (str_is_name(tok[1], "task2", "selectTask2", "t2")) { Task_SelectTask2(); return; }
-            if (str_is_name(tok[1], "task3", "selectTask3", "t3")) { Task_SelectOnly(3U); Prompt_Start(330); return; }
-            if (str_is_name(tok[1], "task4", "selectTask4", "t4")) { Task_SelectOnly(4U); Prompt_Start(400); return; }
-            if (str_is_name(tok[1], "start", "run", "taskStart")) { Task_StartSelected(); return; }
-            if (str_is_name(tok[1], "taskStop", "taskReset", "taskIdle")) { Task_Stop(); return; }
-            if (str_is_name(tok[1], "arcTest", "arc", "arcRun")) { Task_Reset(); Arc_Start(); return; }
-            if (str_is_name(tok[1], "tracing", "trace", "line")) { App_StartTracingMode(); return; }
-            if (str_is_name(tok[1], "Bluetooth", "BT", "remote")) { App_StartBluetoothMode(); return; }
-        }
-        return;
-    }
-
-    if (str_is_name(tok[0], "slider", "s", 0))
-    {
-        if (n >= 3) Main_ApplySliderPacket(tok[1], (float)atof(tok[2]));
-        return;
-    }
-
-    if (str_is_name(tok[0], "joystick", "j", 0))
-    {
-        Main_ApplyJoystickPacket(tok, n);
-        return;
-    }
+    Task_SelectTask1();
 }
 
-static void Main_BTProcess(void)
+void App_ProtocolSelectTask2(void)
 {
-    static uint8_t receiving = 0;
-    static uint8_t index = 0;
-    static char packet[128];
-    uint8_t byte;
+    Task_SelectTask2();
+}
 
-    while (Serial_ReadByte(&byte))
-    {
-        char c = (char)byte;
-        if (c == '[')
-        {
-            receiving = 1;
-            index = 0;
-            continue;
-        }
-        if (!receiving) continue;
-        if (c == ']')
-        {
-            packet[index] = '\0';
-            receiving = 0;
-            Main_ApplyPacket(packet);
-            g_lastCmdTickMs = 0;
-            continue;
-        }
-        if (c == '\r' || c == '\n') continue;
-        if (index < sizeof(packet) - 1U) packet[index++] = c;
-        else
-        {
-            receiving = 0;
-            index = 0;
-        }
-    }
+void App_ProtocolSelectOnly(uint8_t task)
+{
+    Task_SelectOnly(task);
+}
+
+void App_ProtocolStartSelectedTask(void)
+{
+    Task_StartSelected();
+}
+
+void App_ProtocolTaskStop(void)
+{
+    Task_Stop();
+}
+
+void App_ProtocolArcStart(void)
+{
+    Arc_Start();
+}
+
+uint8_t App_ProtocolTask2IsSpecialState(void)
+{
+    return Task2_IsSpecialState();
 }
 
 /* ================================================================
@@ -2129,24 +1530,7 @@ static void Main_BTProcess(void)
 
 static void Control_Run10ms(void)
 {
-    int16_t leftDelta;
-    int16_t rightDelta;
-    float pwmLimit;
-    int32_t leftPwmTemp;
-    int32_t rightPwmTemp;
-
-    leftDelta = Encoder_GetLeftDelta();
-    rightDelta = Encoder_GetRightDelta();
-
-    g_leftEncoderTotal += leftDelta;
-    g_rightEncoderTotal += rightDelta;
-    g_forwardEncoderTotal = (g_leftEncoderTotal + g_rightEncoderTotal) / 2;
-    g_turnEncoderTotal = (g_rightEncoderTotal - g_leftEncoderTotal) / 2;
-
-    g_leftSpeed = (float)leftDelta;
-    g_rightSpeed = (float)rightDelta;
-    g_forwardSpeed = (g_leftSpeed + g_rightSpeed) * 0.5f;
-    g_turnSpeed = (g_rightSpeed - g_leftSpeed) * 0.5f;
+    App_Control_UpdateEncoderSpeed();
 
     if (g_safetyLocked)
     {
@@ -2154,7 +1538,7 @@ static void Control_Run10ms(void)
         return;
     }
 
-    Control_UpdatePIDParam();
+    App_Control_UpdatePIDParam();
 
     if (Task2_IsSpecialState())
     {
@@ -2170,7 +1554,7 @@ static void Control_Run10ms(void)
     }
     else if (g_workMode == WORK_TRACING)
     {
-        Tracing_Control10ms();
+        App_Line_TracingControl10ms();
     }
     else
     {
@@ -2182,34 +1566,7 @@ static void Control_Run10ms(void)
         }
     }
 
-    if (!g_carEnable || g_pwmLimit <= 0.5f)
-    {
-        g_forwardSpeedError = g_targetForwardSpeed - g_forwardSpeed;
-        g_speedPwm = 0.0f;
-        g_diffPwm = 0.0f;
-        g_leftPwm = 0;
-        g_rightPwm = 0;
-        Motor_StopAll();
-        PID_Reset(&ForwardPID);
-        PID_Reset(&TurnPID);
-        return;
-    }
-
-    pwmLimit = limit_float(g_pwmLimit, PWM_LIMIT_MIN, PWM_LIMIT_MAX);
-    ForwardPID.OutputLimit = pwmLimit;
-    TurnPID.OutputLimit = pwmLimit * 0.85f;
-
-    g_forwardSpeedError = g_targetForwardSpeed - g_forwardSpeed;
-    g_speedPwm = PID_Calc(&ForwardPID, g_targetForwardSpeed, g_forwardSpeed);
-    g_diffPwm = PID_Calc(&TurnPID, g_targetTurnSpeed, g_turnSpeed);
-
-    leftPwmTemp = (int32_t)(g_speedPwm - g_diffPwm);
-    rightPwmTemp = (int32_t)(g_speedPwm + g_diffPwm);
-
-    g_leftPwm = limit_i16(leftPwmTemp, (int16_t)(-pwmLimit), (int16_t)pwmLimit);
-    g_rightPwm = limit_i16(rightPwmTemp, (int16_t)(-pwmLimit), (int16_t)pwmLimit);
-
-    Motor_SetPWM(g_leftPwm, g_rightPwm);
+    App_Control_ApplyMotorOutput();
 }
 
 static int ModeCode(void)
@@ -2318,6 +1675,16 @@ static void Serial_SendPlotStatus(void)
                       (long)Task2_GetWheelDiffPulse(),
                       (int)g_targetTurnSpeed,
                       (int)g_lineValid);
+        return;
+    }
+
+    if (g_plotMode == PLOT_MODE_WEB_PID)
+    {
+        Serial_Printf("[plot,%d,%d,%d,%d]\r\n",
+                      (int)g_targetForwardSpeed,
+                      (int)g_forwardSpeed,
+                      (int)g_forwardSpeedError,
+                      (int)g_speedPwm);
         return;
     }
 
@@ -2432,15 +1799,15 @@ int main(void)
     Motor_Init();
     Encoder_Init();
 
-    Line_GPIOForceInit();
+    App_Line_GPIOForceInit();
     PromptIO_Init();
 
     MPU_AppInit();
     Serial_Init();
     Timer_Init();
-    Control_Init();
+    App_Control_Init();
 
-    ApplySpeedLimitPercent(g_btSpeedLimitPercent);
+    App_Protocol_ApplySpeedLimitPercent(g_btSpeedLimitPercent);
     PromptIO_AllOff();
 
     OLED_Printf(0, 0, OLED_8X16, "Local Standby");
@@ -2451,7 +1818,7 @@ int main(void)
 
     while (1)
     {
-        Main_BTProcess();
+        App_Protocol_Process();
         Main_KeyProcess();
 
         if (g_mpuUpdateMs >= MPU_UPDATE_PERIOD_MS)
