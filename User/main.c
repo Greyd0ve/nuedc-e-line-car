@@ -301,7 +301,7 @@ volatile float g_task2StraightToSearchPulse = 6500.0f;
  * 你的轮距初值约 B=(14.7+11.1)/2=12.9 cm，pulsePerCm=70.30：
  * diff = 12.9*pi*70.30 ≈ 2850 pulse。
  */
-volatile float g_task2ArcWheelDiffTarget = 2850.0f;
+volatile float g_task2ArcWheelDiffTarget = 2750.0f;
 
 /* 弧线阶段平均脉冲下限。只有走过足够长的弧线后，丢线才允许判定为出弯。 */
 volatile float g_task2ArcMinForwardPulse = 6500.0f;
@@ -421,15 +421,32 @@ static void Main_DelayMs(uint16_t ms)
 #define PROMPT_LED_PORT        GPIOB
 #define PROMPT_LED_PIN         GPIO_Pin_5
 
-static void PromptIO_BeepOn(void)  { GPIO_ResetBits(PROMPT_BEEP_PORT, PROMPT_BEEP_PIN); }
-static void PromptIO_BeepOff(void) { GPIO_SetBits(PROMPT_BEEP_PORT, PROMPT_BEEP_PIN); }
+#define PROMPT_BEEP_ENABLE      0
+
+static void PromptIO_BeepOn(void)
+{
+#if PROMPT_BEEP_ENABLE
+    GPIO_ResetBits(PROMPT_BEEP_PORT, PROMPT_BEEP_PIN);
+#else
+    GPIO_SetBits(PROMPT_BEEP_PORT, PROMPT_BEEP_PIN);
+#endif
+}
+
+static void PromptIO_BeepOff(void)
+{
+    GPIO_SetBits(PROMPT_BEEP_PORT, PROMPT_BEEP_PIN);
+}
 static void PromptIO_LedOn(void)   { GPIO_SetBits(PROMPT_LED_PORT, PROMPT_LED_PIN); }
 static void PromptIO_LedOff(void)  { GPIO_ResetBits(PROMPT_LED_PORT, PROMPT_LED_PIN); }
 
 static void PromptIO_BeepTurn(void)
 {
+#if PROMPT_BEEP_ENABLE
     if (GPIO_ReadOutputDataBit(PROMPT_BEEP_PORT, PROMPT_BEEP_PIN)) PromptIO_BeepOn();
     else PromptIO_BeepOff();
+#else
+    PromptIO_BeepOff();
+#endif
 }
 
 static void PromptIO_LedTurn(void)
@@ -524,6 +541,8 @@ static void MPU_ResetYaw(void)
     g_yawTotalDeg = 0.0f;
 }
 
+
+
 static void MPU_AppInit(void)
 {
     if (g_mpuInitTryCount < 255U) g_mpuInitTryCount++;
@@ -547,6 +566,30 @@ static void MPU_AppInit(void)
         g_mpuReady = 0;
         g_mpuCalibrated = 0;
     }
+}
+
+static void MPU_ManualYawZero(void)
+{
+    if (!g_mpuReady)
+    {
+        MPU_AppInit();
+    }
+
+    if (!g_mpuReady)
+    {
+        Prompt_Start(900);
+        return;
+    }
+
+    g_gyroZDps = 0.0f;
+    g_yawDeg = 0.0f;
+    g_yawTotalDeg = 0.0f;
+
+    /* 手动确认：认为当前 yaw 已经可用于直线航向保持 */
+    g_mpuCalibrated = 1;
+    g_mpuErr = MPU6050_OK;
+
+    Prompt_Start(180);
 }
 
 static void MPU_UpdateYaw(uint16_t elapsedMs)
@@ -1839,11 +1882,10 @@ static void Local_ExecuteSelectedTask(void)
     }
 
     if (g_localMode == LOCAL_MPU_DEBUG)
-    {
-        MPU_ResetYaw();
-        Prompt_Start(180);
-        return;
-    }
+		{
+				MPU_ManualYawZero();
+				return;
+		}
 
     g_localMode = LOCAL_STANDBY;
     g_workMode = WORK_STANDBY;
