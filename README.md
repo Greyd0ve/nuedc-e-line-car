@@ -1,5 +1,7 @@
 # NUEDC H Smart Car
 
+Maintenance note: documentation sync update.
+
 本仓库用于记录电赛 H 题自动行驶小车的 STM32 控制程序。
 
 ## 项目简介

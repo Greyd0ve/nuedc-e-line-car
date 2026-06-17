@@ -169,7 +169,21 @@ typedef enum
     TASK2_TRACE_ARC_DA,
     TASK2_WAIT_ALIGN_A,
     TASK2_ALIGN_A,
-    TASK2_FINISH
+    TASK2_FINISH,
+
+    TASK_READY_TASK3,
+    TASK3_STRAIGHT_AC,
+    TASK3_SEARCH_ARC_CB,
+    TASK3_TRACE_ARC_CB,
+    TASK3_WAIT_ALIGN_B,
+    TASK3_ALIGN_B,
+    TASK3_TURN_BD,
+    TASK3_STRAIGHT_BD,
+    TASK3_SEARCH_ARC_DA,
+    TASK3_TRACE_ARC_DA,
+    TASK3_WAIT_ALIGN_A,
+    TASK3_ALIGN_A,
+    TASK3_FINISH
 } TaskState_t;
 
 volatile WorkMode_t g_workMode = WORK_STANDBY;
@@ -326,6 +340,12 @@ volatile float g_task2CurrentTurnSign = -1.0f;
 volatile uint16_t g_task2AlignWaitMs = 0;
 volatile uint16_t g_task2AlignWaitTargetMs = 500U;
 
+volatile float g_task3DiagToSearchPulse = 8500.0f;
+volatile float g_task3DiagTurnDiffTarget = 600.0f;
+volatile float g_task3CbTurnSign = 1.0f;
+volatile float g_task3BdTurnSign = 1.0f;
+volatile float g_task3DaTurnSign = 1.0f;
+
 /* ================================================================
  * 6. 前向声明
  * ================================================================ */
@@ -333,6 +353,10 @@ volatile uint16_t g_task2AlignWaitTargetMs = 500U;
 static void Task2_SearchArcStart(float turnSign);
 static uint8_t Task2_IsSpecialState(void);
 static void Task2_Control10ms(void);
+static void Task3_SearchArcStart(float turnSign);
+static uint8_t Task3_IsSpecialState(void);
+static void Task3_Control10ms(void);
+static uint8_t TaskAuto_IsSpecialState(void);
 static void Task_Stop(void);
 static void Local_EnterStandby(void);
 static void Local_CycleMode(void);
@@ -706,6 +730,22 @@ static void Straight_Finish(void)
         return;
     }
 
+    if (g_taskState == TASK3_STRAIGHT_AC)
+    {
+        g_taskState = TASK3_SEARCH_ARC_CB;
+        Task3_SearchArcStart(g_task3CbTurnSign);
+        Prompt_Start(120);
+        return;
+    }
+
+    if (g_taskState == TASK3_STRAIGHT_BD)
+    {
+        g_taskState = TASK3_SEARCH_ARC_DA;
+        Task3_SearchArcStart(g_task3DaTurnSign);
+        Prompt_Start(120);
+        return;
+    }
+
     Control_ForcePWMZero();
     g_plotMode = 3U;
     Prompt_Start(500);
@@ -976,7 +1016,7 @@ static void Task2_ControlSearch10ms(void)
     Task2_ApplyYawStraightHold(g_task2SearchSpeed);
 }
 
-static void Task2_TraceLineNoLost10ms(void)
+static void Task_TraceLineNoLost10ms(void)
 {
     float forward;
     float turn;
@@ -993,10 +1033,8 @@ static void Task2_TraceLineNoLost10ms(void)
     }
 
     /*
-     * 本函数只用于 task2 的半圆弧 TRACE 阶段。
-     * 外部已经调用过 App_Line_Update()。
-     * 如果 lineValid=0，绝不执行普通循迹里的 lostTurn 找线逻辑，
-     * 只停车等待状态机进入 WAIT_ALIGN/ALIGN。
+     * Used by task2/task3 arc trace states after App_Line_Update().
+     * When lineValid=0, do not run the normal lostTurn search logic.
      */
     if (!g_lineValid)
     {
@@ -1054,7 +1092,7 @@ static void Task2_ControlTrace10ms(void)
     if (g_lineValid)
     {
         g_task2LineLostMs = 0;
-        Task2_TraceLineNoLost10ms();
+        Task_TraceLineNoLost10ms();
         g_lastCmdTickMs = 0;
         return;
     }
@@ -1179,6 +1217,367 @@ static void Task2_Control10ms(void)
     }
 }
 
+static uint8_t Task3_IsSearchState(void)
+{
+    return (g_taskState == TASK3_SEARCH_ARC_CB || g_taskState == TASK3_SEARCH_ARC_DA);
+}
+
+static uint8_t Task3_IsTraceState(void)
+{
+    return (g_taskState == TASK3_TRACE_ARC_CB || g_taskState == TASK3_TRACE_ARC_DA);
+}
+
+static uint8_t Task3_IsWaitAlignState(void)
+{
+    return (g_taskState == TASK3_WAIT_ALIGN_B || g_taskState == TASK3_WAIT_ALIGN_A);
+}
+
+static uint8_t Task3_IsAlignState(void)
+{
+    return (g_taskState == TASK3_ALIGN_B || g_taskState == TASK3_ALIGN_A);
+}
+
+static uint8_t Task3_IsTurnBdState(void)
+{
+    return (g_taskState == TASK3_TURN_BD);
+}
+
+static uint8_t Task3_IsSpecialState(void)
+{
+    return (uint8_t)(Task3_IsSearchState() || Task3_IsTraceState() ||
+                     Task3_IsWaitAlignState() || Task3_IsAlignState() ||
+                     Task3_IsTurnBdState());
+}
+
+static uint8_t TaskAuto_IsSpecialState(void)
+{
+    return (uint8_t)(Task2_IsSpecialState() || Task3_IsSpecialState());
+}
+
+static void Task3_SearchArcStart(float turnSign)
+{
+    g_straightActive = 0;
+    g_arcActive = 0;
+    g_workMode = WORK_BT;
+    g_plotMode = 4U;
+
+    g_task2CurrentTurnSign = (turnSign < 0.0f) ? -1.0f : 1.0f;
+    g_task2LineValidMs = 0;
+    g_task2LineLostMs = 0;
+    g_task2AlignWaitMs = 0;
+    g_arcRunMs = 0;
+    g_arcStartYaw = g_yawDeg;
+    g_arcDeltaYaw = 0.0f;
+
+    g_task2SearchStartPulse = (float)g_forwardEncoderTotal;
+
+    App_Line_ResetState();
+
+    g_carEnable = 1;
+    g_lastCmdTickMs = 0;
+}
+
+static void Task3_StartTraceArc(void)
+{
+    Encoder_ClearTotalsOnly();
+
+    g_arcRunMs = 0;
+    g_arcStartYaw = g_yawDeg;
+    g_arcDeltaYaw = 0.0f;
+    g_task2LineLostMs = 0;
+    g_task2LineValidMs = 0;
+
+    App_Line_ResetState();
+
+    if (g_taskState == TASK3_SEARCH_ARC_CB) g_taskState = TASK3_TRACE_ARC_CB;
+    else if (g_taskState == TASK3_SEARCH_ARC_DA) g_taskState = TASK3_TRACE_ARC_DA;
+
+    App_Control_ResetPID();
+    Prompt_Start(120);
+}
+
+static void Task3_FinishTraceArc(void)
+{
+    Control_ForcePWMZero();
+    g_task2AlignWaitMs = 0;
+
+    if (g_taskState == TASK3_TRACE_ARC_CB)
+    {
+        g_taskState = TASK3_WAIT_ALIGN_B;
+        Prompt_Start(180);
+        return;
+    }
+
+    if (g_taskState == TASK3_TRACE_ARC_DA)
+    {
+        g_taskState = TASK3_WAIT_ALIGN_A;
+        Prompt_Start(180);
+        return;
+    }
+}
+
+static void Task3_StartTurnBD(void)
+{
+    Control_ForcePWMZero();
+    Encoder_ClearTotalsOnly();
+    App_Control_ResetPID();
+
+    g_taskState = TASK3_TURN_BD;
+    g_workMode = WORK_BT;
+    g_plotMode = 4U;
+    g_arcRunMs = 0;
+    g_arcStartYaw = g_yawDeg;
+    g_arcDeltaYaw = 0.0f;
+    g_task2LineValidMs = 0;
+    g_task2LineLostMs = 0;
+    g_task2AlignWaitMs = 0;
+
+    Prompt_Start(180);
+}
+
+static void Task3_FinishTurnBD(void)
+{
+    Control_ForcePWMZero();
+    g_taskState = TASK3_STRAIGHT_BD;
+    g_straightDistancePulse = g_task3DiagToSearchPulse;
+    Straight_Start();
+
+    if (!g_straightActive)
+    {
+        g_taskRunning = 0;
+        g_taskState = TASK_READY_TASK3;
+    }
+
+    Prompt_Start(160);
+}
+
+static void Task3_FinishAlign(void)
+{
+    if (g_taskState == TASK3_ALIGN_B)
+    {
+        Task3_StartTurnBD();
+        return;
+    }
+
+    if (g_taskState == TASK3_ALIGN_A)
+    {
+        g_taskRunning = 0;
+        g_taskState = TASK3_FINISH;
+        g_workMode = WORK_BT;
+        g_plotMode = 3U;
+        Control_ForcePWMZero();
+        Prompt_Start(1000);
+        return;
+    }
+}
+
+static void Task3_ControlSearch10ms(void)
+{
+    float searchDeltaPulse;
+
+    if (g_arcRunMs < 60000U - CONTROL_PERIOD_MS) g_arcRunMs += CONTROL_PERIOD_MS;
+    g_arcDeltaYaw = wrap_180(g_yawDeg - g_arcStartYaw);
+
+    App_Line_Update();
+
+    if (g_lineValid)
+    {
+        if (g_task2LineValidMs < 60000U - CONTROL_PERIOD_MS)
+        {
+            g_task2LineValidMs += CONTROL_PERIOD_MS;
+        }
+    }
+    else
+    {
+        g_task2LineValidMs = 0;
+    }
+
+    if (g_task2LineValidMs >= g_task2LineFoundConfirmMs)
+    {
+        Task3_StartTraceArc();
+        return;
+    }
+
+    searchDeltaPulse = absf_local((float)g_forwardEncoderTotal - g_task2SearchStartPulse);
+    if (searchDeltaPulse >= g_task2SearchMaxPulse)
+    {
+        Task_Stop();
+        return;
+    }
+
+    Task2_ApplyYawStraightHold(g_task2SearchSpeed);
+}
+
+static void Task3_TraceLineNoLost10ms(void)
+{
+    Task_TraceLineNoLost10ms();
+}
+
+static void Task3_ControlTrace10ms(void)
+{
+    float forwardAbs;
+
+    if (g_arcRunMs < 60000U - CONTROL_PERIOD_MS)
+    {
+        g_arcRunMs += CONTROL_PERIOD_MS;
+    }
+    g_arcDeltaYaw = wrap_180(g_yawDeg - g_arcStartYaw);
+
+    App_Line_Update();
+    forwardAbs = absf_local((float)g_forwardEncoderTotal);
+
+    if (g_lineValid)
+    {
+        g_task2LineLostMs = 0;
+        Task3_TraceLineNoLost10ms();
+        g_lastCmdTickMs = 0;
+        return;
+    }
+
+    g_targetForwardSpeed = 0.0f;
+    g_targetTurnSpeed = 0.0f;
+    g_carEnable = 1;
+    g_lastCmdTickMs = 0;
+
+    if (g_task2LineLostMs < 60000U - CONTROL_PERIOD_MS)
+    {
+        g_task2LineLostMs += CONTROL_PERIOD_MS;
+    }
+
+    if ((g_arcRunMs >= g_arcMinTimeMs) &&
+        (forwardAbs >= g_task2ArcMinForwardPulse) &&
+        (g_task2LineLostMs >= g_task2LineLostConfirmMs))
+    {
+        Task3_FinishTraceArc();
+        return;
+    }
+}
+
+static void Task3_ControlWaitAlign10ms(void)
+{
+    g_targetForwardSpeed = 0.0f;
+    g_targetTurnSpeed = 0.0f;
+    g_carEnable = 0;
+    Motor_StopAll();
+    App_Control_ResetPID();
+    g_lastCmdTickMs = 0;
+
+    if (g_task2AlignWaitMs < 60000U - CONTROL_PERIOD_MS)
+    {
+        g_task2AlignWaitMs += CONTROL_PERIOD_MS;
+    }
+
+    if (g_task2AlignWaitMs < g_task2AlignWaitTargetMs)
+    {
+        return;
+    }
+
+    g_task2AlignWaitMs = 0;
+
+    if (g_taskState == TASK3_WAIT_ALIGN_B)
+    {
+        g_taskState = TASK3_ALIGN_B;
+        g_targetForwardSpeed = 0.0f;
+        g_targetTurnSpeed = 0.0f;
+        g_carEnable = 1;
+        Prompt_Start(120);
+        return;
+    }
+
+    if (g_taskState == TASK3_WAIT_ALIGN_A)
+    {
+        g_taskState = TASK3_ALIGN_A;
+        g_targetForwardSpeed = 0.0f;
+        g_targetTurnSpeed = 0.0f;
+        g_carEnable = 1;
+        Prompt_Start(120);
+        return;
+    }
+}
+
+static void Task3_ControlAlign10ms(void)
+{
+    int32_t wheelDiffAbs;
+    int32_t targetDiff;
+    float turnTarget;
+
+    wheelDiffAbs = abs_i32_local(Task2_GetWheelDiffPulse());
+    targetDiff = (int32_t)g_task2ArcWheelDiffTarget;
+
+    if (wheelDiffAbs >= targetDiff)
+    {
+        Task3_FinishAlign();
+        return;
+    }
+
+    if (g_taskState == TASK3_ALIGN_B) turnTarget = g_task3CbTurnSign * g_task2AlignTurnSpeed;
+    else turnTarget = g_task3DaTurnSign * g_task2AlignTurnSpeed;
+
+    g_targetForwardSpeed = slew_float(g_targetForwardSpeed, 0.0f, g_forwardSlewStep);
+    g_targetTurnSpeed = slew_float(g_targetTurnSpeed, turnTarget, g_turnSlewStep);
+    g_carEnable = 1;
+    g_lastCmdTickMs = 0;
+}
+
+static void Task3_ControlTurnBD10ms(void)
+{
+    int32_t wheelDiffAbs;
+    int32_t targetDiff;
+
+    if (g_arcRunMs < 60000U - CONTROL_PERIOD_MS)
+    {
+        g_arcRunMs += CONTROL_PERIOD_MS;
+    }
+    g_arcDeltaYaw = wrap_180(g_yawDeg - g_arcStartYaw);
+
+    wheelDiffAbs = abs_i32_local(Task2_GetWheelDiffPulse());
+    targetDiff = (int32_t)g_task3DiagTurnDiffTarget;
+
+    if (wheelDiffAbs >= targetDiff)
+    {
+        Task3_FinishTurnBD();
+        return;
+    }
+
+    g_targetForwardSpeed = 0.0f;
+    g_targetTurnSpeed = g_task3BdTurnSign * g_task2AlignTurnSpeed;
+    g_carEnable = 1;
+    g_lastCmdTickMs = 0;
+}
+
+static void Task3_Control10ms(void)
+{
+    if (Task3_IsSearchState())
+    {
+        Task3_ControlSearch10ms();
+        return;
+    }
+
+    if (Task3_IsTraceState())
+    {
+        Task3_ControlTrace10ms();
+        return;
+    }
+
+    if (Task3_IsWaitAlignState())
+    {
+        Task3_ControlWaitAlign10ms();
+        return;
+    }
+
+    if (Task3_IsAlignState())
+    {
+        Task3_ControlAlign10ms();
+        return;
+    }
+
+    if (Task3_IsTurnBdState())
+    {
+        Task3_ControlTurnBD10ms();
+        return;
+    }
+}
+
 static void Task_Reset(void)
 {
     g_taskState = TASK_IDLE;
@@ -1190,6 +1589,9 @@ static void Task_Reset(void)
     g_task2LineLostMs = 0;
     g_task2AlignWaitMs = 0;
     g_task2SearchStartPulse = 0.0f;
+    g_task2CurrentTurnSign = g_task2BcTurnSign;
+    g_arcRunMs = 0;
+    g_arcDeltaYaw = 0.0f;
 }
 
 static void Task_SelectTask1(void)
@@ -1246,9 +1648,13 @@ static void Task_SelectOnly(uint8_t task)
     {
         g_taskState = TASK_READY_TASK2;
     }
+    else if (task == 3U)
+    {
+        g_taskState = TASK_READY_TASK3;
+    }
     else
     {
-        /* task3/task4 暂未实现：仅保留选择状态，K3 执行时空执行提示。 */
+        /* task4 remains selected only; K3 gives a no-motion prompt. */
         g_taskState = TASK_IDLE;
     }
 }
@@ -1295,7 +1701,22 @@ static void Task_StartSelected(void)
         return;
     }
 
-    /* task3/task4 暂未实现：空执行，只声光提示，不运动。 */
+    /* task4 remains a no-motion placeholder. */
+    if (g_taskSelected == 3U)
+    {
+        g_straightDistancePulse = g_task3DiagToSearchPulse;
+        g_taskRunning = 1;
+        g_taskState = TASK3_STRAIGHT_AC;
+        Straight_Start();
+
+        if (!g_straightActive)
+        {
+            g_taskRunning = 0;
+            g_taskState = TASK_READY_TASK3;
+        }
+        return;
+    }
+
     Control_ForcePWMZero();
     g_taskRunning = 0;
     g_taskState = TASK_IDLE;
@@ -1351,7 +1772,7 @@ static void Local_EnterMpuDebug(void)
 
 static void Local_CycleMode(void)
 {
-    if (g_taskRunning || g_straightActive || g_arcActive || Task2_IsSpecialState())
+    if (g_taskRunning || g_straightActive || g_arcActive || TaskAuto_IsSpecialState())
     {
         Prompt_Start(80);
         return;
@@ -1374,7 +1795,7 @@ static void Local_CycleMode(void)
 
 static void Local_SelectNextTask(void)
 {
-    if (g_taskRunning || g_straightActive || g_arcActive || Task2_IsSpecialState())
+    if (g_taskRunning || g_straightActive || g_arcActive || TaskAuto_IsSpecialState())
     {
         Prompt_Start(80);
         return;
@@ -1405,7 +1826,7 @@ static void Local_ExecuteSelectedTask(void)
         return;
     }
 
-    if (g_taskRunning || g_straightActive || g_arcActive || Task2_IsSpecialState())
+    if (g_taskRunning || g_straightActive || g_arcActive || TaskAuto_IsSpecialState())
     {
         Prompt_Start(80);
         return;
@@ -1521,7 +1942,7 @@ void App_ProtocolArcStart(void)
 
 uint8_t App_ProtocolTask2IsSpecialState(void)
 {
-    return Task2_IsSpecialState();
+    return TaskAuto_IsSpecialState();
 }
 
 /* ================================================================
@@ -1540,9 +1961,10 @@ static void Control_Run10ms(void)
 
     App_Control_UpdatePIDParam();
 
-    if (Task2_IsSpecialState())
+    if (TaskAuto_IsSpecialState())
     {
-        Task2_Control10ms();
+        if (Task2_IsSpecialState()) Task2_Control10ms();
+        else Task3_Control10ms();
     }
     else if (g_straightActive)
     {
@@ -1576,6 +1998,7 @@ static int ModeCode(void)
     if (g_arcActive) return 4;
     if (g_taskState == TASK_READY_TASK1) return 11;
     if (g_taskState == TASK_READY_TASK2) return 21;
+    if (g_taskState == TASK_READY_TASK3) return 23;
     if (g_taskState == TASK2_SEARCH_ARC_BC) return 31;
     if (g_taskState == TASK2_TRACE_ARC_BC) return 32;
     if (g_taskState == TASK2_WAIT_ALIGN_C) return 37;
@@ -1585,6 +2008,16 @@ static int ModeCode(void)
     if (g_taskState == TASK2_WAIT_ALIGN_A) return 38;
     if (g_taskState == TASK2_ALIGN_A) return 36;
     if (g_taskState == TASK2_FINISH) return 22;
+    if (g_taskState == TASK3_SEARCH_ARC_CB) return 51;
+    if (g_taskState == TASK3_TRACE_ARC_CB) return 52;
+    if (g_taskState == TASK3_WAIT_ALIGN_B) return 57;
+    if (g_taskState == TASK3_ALIGN_B) return 53;
+    if (g_taskState == TASK3_TURN_BD) return 54;
+    if (g_taskState == TASK3_SEARCH_ARC_DA) return 55;
+    if (g_taskState == TASK3_TRACE_ARC_DA) return 56;
+    if (g_taskState == TASK3_WAIT_ALIGN_A) return 58;
+    if (g_taskState == TASK3_ALIGN_A) return 59;
+    if (g_taskState == TASK3_FINISH) return 63;
     if (g_taskState == TASK_FINISH) return 12;
     if (g_workMode == WORK_STANDBY)
     {
@@ -1602,6 +2035,11 @@ static char *ModeString(void)
     if (Task2_IsSearchState()) return "SRCH";
     if (Task2_IsTraceState()) return "ARC";
     if (Task2_IsAlignState()) return "ALGN";
+    if (Task3_IsSearchState()) return "SRCH";
+    if (Task3_IsTraceState()) return "ARC";
+    if (Task3_IsWaitAlignState()) return "WAIT";
+    if (Task3_IsAlignState()) return "ALGN";
+    if (Task3_IsTurnBdState()) return "TURN";
     if (g_arcActive) return "ARC";
     if (g_workMode == WORK_TRACING) return "TRACE";
     if (g_workMode == WORK_BT) return "BT";
@@ -1735,7 +2173,7 @@ static void OLED_ShowStatus(void)
 
     if (g_plotMode == 4U)
     {
-        OLED_Printf(0, 0, OLED_8X16, "T2 S:%02d R:%04d", (int)g_taskState, (int)g_arcRunMs);
+        OLED_Printf(0, 0, OLED_8X16, "T%d S:%02d R:%04d", (int)g_taskSelected, (int)g_taskState, (int)g_arcRunMs);
         OLED_Printf(0, 16, OLED_8X16, "E:%+04d M:%02X", (int)g_lineError, (int)g_lineMask);
         OLED_Printf(0, 32, OLED_8X16, "F:%+05ld", (long)g_forwardEncoderTotal);
         OLED_Printf(0, 48, OLED_8X16, "D:%+05ld V:%d", (long)Task2_GetWheelDiffPulse(), (int)g_lineValid);

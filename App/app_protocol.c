@@ -95,6 +95,11 @@ extern volatile float g_task2AlignTurnSpeed;
 extern volatile float g_task2BcTurnSign;
 extern volatile float g_task2DaTurnSign;
 extern volatile uint16_t g_task2AlignWaitTargetMs;
+extern volatile float g_task3DiagToSearchPulse;
+extern volatile float g_task3DiagTurnDiffTarget;
+extern volatile float g_task3CbTurnSign;
+extern volatile float g_task3BdTurnSign;
+extern volatile float g_task3DaTurnSign;
 
 static float App_Protocol_LimitFloat(float value, float minVal, float maxVal)
 {
@@ -498,6 +503,34 @@ static uint8_t App_Protocol_ApplySliderPacket(const char *name, float value)
     {
         if (value < -1.0f || value > 1.0f) { App_Protocol_RecordError(PROTO_ERR_RANGE, "range", 1U); return PROTO_RESULT_ERROR; }
         g_task2DaTurnSign = (value < 0.0f) ? -1.0f : 1.0f;
+        return App_Protocol_ResultOk(1U);
+    }
+    if (App_Protocol_IsName(name, "task3SearchPulse", "task3DiagPulse", "diagSearchPulse"))
+    {
+        if (!App_Protocol_SetFloatRange(&g_task3DiagToSearchPulse, value, 3000.0f, 15000.0f)) return PROTO_RESULT_ERROR;
+        return App_Protocol_ResultOk(1U);
+    }
+    if (App_Protocol_IsName(name, "task3TurnDiff", "task3DiagTurnDiff", "bdTurnDiff"))
+    {
+        if (!App_Protocol_SetFloatRange(&g_task3DiagTurnDiffTarget, value, 100.0f, 3000.0f)) return PROTO_RESULT_ERROR;
+        return App_Protocol_ResultOk(1U);
+    }
+    if (App_Protocol_IsName(name, "task3CbTurnSign", "task3CbSign", "cbTurnSign"))
+    {
+        if (value < -1.0f || value > 1.0f) { App_Protocol_RecordError(PROTO_ERR_RANGE, "range", 1U); return PROTO_RESULT_ERROR; }
+        g_task3CbTurnSign = (value < 0.0f) ? -1.0f : 1.0f;
+        return App_Protocol_ResultOk(1U);
+    }
+    if (App_Protocol_IsName(name, "task3BdTurnSign", "task3BdSign", "bdTurnSign"))
+    {
+        if (value < -1.0f || value > 1.0f) { App_Protocol_RecordError(PROTO_ERR_RANGE, "range", 1U); return PROTO_RESULT_ERROR; }
+        g_task3BdTurnSign = (value < 0.0f) ? -1.0f : 1.0f;
+        return App_Protocol_ResultOk(1U);
+    }
+    if (App_Protocol_IsName(name, "task3DaTurnSign", "task3DaSign", "task3ArcDaSign"))
+    {
+        if (value < -1.0f || value > 1.0f) { App_Protocol_RecordError(PROTO_ERR_RANGE, "range", 1U); return PROTO_RESULT_ERROR; }
+        g_task3DaTurnSign = (value < 0.0f) ? -1.0f : 1.0f;
         return App_Protocol_ResultOk(1U);
     }
 
