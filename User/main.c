@@ -263,7 +263,7 @@ volatile float g_yawTotalDeg = 0.0f;
 /* straight 直线航向保持参数。 */
 volatile uint8_t g_straightActive = 0;
 volatile uint8_t g_straightDone = 0;
-volatile float g_straightSpeed = 15.0f;
+volatile float g_straightSpeed = 32.0f;
 volatile float g_straightDistancePulse = STRAIGHT_DISTANCE_DEFAULT;
 volatile float g_straightTargetYaw = 0.0f;
 volatile float g_straightYawError = 0.0f;
@@ -287,6 +287,9 @@ volatile uint8_t g_taskRunning = 0;
 volatile float g_task1DistancePulse = STRAIGHT_DISTANCE_DEFAULT;
 volatile float g_task2DistancePulse = STRAIGHT_DISTANCE_DEFAULT;
 volatile float g_taskStopOffsetPulse = STRAIGHT_STOP_OFFSET_DEFAULT;
+volatile float g_taskStartYaw = 0.0f;
+volatile float g_task1MinLinePulse = 4000.0f;
+volatile uint8_t g_task1UseLineStop = 1U;
 
 /* ================================================================
  * 5. task2_encoder_v1 新参数
@@ -301,7 +304,7 @@ volatile float g_task2StraightToSearchPulse = 6500.0f;
  * 你的轮距初值约 B=(14.7+11.1)/2=12.9 cm，pulsePerCm=70.30：
  * diff = 12.9*pi*70.30 ≈ 2850 pulse。
  */
-volatile float g_task2ArcWheelDiffTarget = 2750.0f;
+volatile float g_task2ArcWheelDiffTarget = 2800.0f;
 
 /* 弧线阶段平均脉冲下限。只有走过足够长的弧线后，丢线才允许判定为出弯。 */
 volatile float g_task2ArcMinForwardPulse = 6500.0f;
@@ -313,7 +316,7 @@ volatile uint16_t g_task2LineFoundConfirmMs = 80U;
 volatile uint16_t g_task2LineLostConfirmMs = 0U;
 
 /* SEARCH_ARC 阶段：继续按直线 yaw 低速前进找半圆弧黑线。 */
-volatile float g_task2SearchSpeed = 12.0f;
+volatile float g_task2SearchSpeed = 20.0f;
 
 /* ALIGN 阶段：补足左右轮脉冲差时的目标转向速度。 */
 volatile float g_task2AlignTurnSpeed = 12.0f;
@@ -345,6 +348,34 @@ volatile float g_task3DiagTurnDiffTarget = 600.0f;
 volatile float g_task3CbTurnSign = 1.0f;
 volatile float g_task3BdTurnSign = 1.0f;
 volatile float g_task3DaTurnSign = 1.0f;
+
+volatile float g_entrySpeed = 12.0f;
+volatile float g_entryYawKp = 1.8f;
+volatile float g_entryYawKd = 0.15f;
+volatile float g_entryTurnLimit = 120.0f;
+
+volatile float g_task2BcEntryYaw = -20.0f;
+volatile float g_task2DaEntryYaw = 20.0f;
+volatile float g_task3CbEntryYaw = -60.0f;
+volatile float g_task3DaEntryYaw = 60.0f;
+
+volatile float g_arcEntryTargetYaw = 0.0f;
+volatile uint8_t g_arcEntryTargetValid = 0U;
+
+volatile float g_arcExitYawWindowDeg = 45.0f;
+
+volatile float g_task2BcExitYaw = 180.0f;
+volatile float g_task2DaExitYaw = 0.0f;
+volatile float g_task3CbExitYaw = 150.0f;
+volatile float g_task3DaExitYaw = 0.0f;
+
+volatile float g_yawAlignToleranceDeg = 4.0f;
+volatile float g_yawAlignTurnSpeed = 8.0f;
+volatile uint16_t g_yawAlignMaxMs = 2500U;
+volatile float g_yawAlignMaxWheelDiff = 3600.0f;
+
+volatile float g_task3AcYawDeg = 39.0f;
+volatile float g_task3BdYawDeg = 135.0f;
 
 /* ================================================================
  * 6. 前向声明
@@ -531,6 +562,81 @@ static int32_t Task2_GetWheelDiffPulse(void)
     return g_rightEncoderTotal - g_leftEncoderTotal;
 }
 
+static float Nav_YawError(float targetYaw)
+{
+    return wrap_180(targetYaw - g_yawDeg);
+}
+
+static uint8_t Nav_YawInWindow(float targetYaw, float windowDeg)
+{
+    return (absf_local(Nav_YawError(targetYaw)) <= windowDeg) ? 1U : 0U;
+}
+
+static void Task_ApplyYawEntryHold(float targetYaw, float speed)
+{
+    float yawErr;
+    float turnCmd;
+
+    yawErr = Nav_YawError(targetYaw);
+    turnCmd = g_entryYawKp * yawErr - g_entryYawKd * g_gyroZDps;
+    turnCmd = limit_float(turnCmd, -g_entryTurnLimit, g_entryTurnLimit);
+
+    /*
+     * If the real car turns opposite to this yaw command, keep motor wiring/macros
+     * unchanged and invert entry yaw signs or this command direction as one policy.
+     */
+    g_arcDeltaYaw = yawErr;
+    g_targetForwardSpeed = slew_float(g_targetForwardSpeed, speed, g_forwardSlewStep);
+    g_targetTurnSpeed = slew_float(g_targetTurnSpeed, turnCmd, g_turnSlewStep);
+    g_carEnable = 1;
+    g_lastCmdTickMs = 0;
+}
+
+static uint8_t Nav_YawAlignControl10ms(float targetYaw)
+{
+    float err;
+    float absErr;
+    int32_t wheelDiffAbs;
+
+    if (g_arcRunMs < 60000U - CONTROL_PERIOD_MS)
+    {
+        g_arcRunMs += CONTROL_PERIOD_MS;
+    }
+
+    err = Nav_YawError(targetYaw);
+    absErr = absf_local(err);
+    wheelDiffAbs = abs_i32_local(Task2_GetWheelDiffPulse());
+
+    g_arcDeltaYaw = err;
+
+    if (absErr <= g_yawAlignToleranceDeg)
+    {
+        return 1U;
+    }
+
+    if (g_arcRunMs >= g_yawAlignMaxMs)
+    {
+        return 1U;
+    }
+
+    if ((float)wheelDiffAbs >= g_yawAlignMaxWheelDiff)
+    {
+        return 1U;
+    }
+
+    g_targetForwardSpeed = slew_float(g_targetForwardSpeed, 0.0f, g_forwardSlewStep);
+    g_targetTurnSpeed = slew_float(
+        g_targetTurnSpeed,
+        (err > 0.0f) ? g_yawAlignTurnSpeed : -g_yawAlignTurnSpeed,
+        g_turnSlewStep
+    );
+
+    g_carEnable = 1;
+    g_lastCmdTickMs = 0;
+
+    return 0U;
+}
+
 /* ================================================================
  * 10. MPU6050 yaw 读取、积分和零偏校准
  * ================================================================ */
@@ -712,6 +818,17 @@ static void Straight_Start(void)
     Prompt_Start(120);
 }
 
+static void Straight_StartToYaw(float targetYaw, float distancePulse)
+{
+    g_straightDistancePulse = distancePulse;
+    Straight_Start();
+
+    if (g_straightActive)
+    {
+        g_straightTargetYaw = wrap_180(targetYaw);
+        g_straightYawError = 0.0f;
+    }
+}
 
 static float Task_GetStraightStopThreshold(float realDistancePulse)
 {
@@ -796,9 +913,23 @@ static void Straight_Finish(void)
 
 static void Straight_Control10ms(void)
 {
+    float forwardAbs;
+
     if (!g_straightActive) return;
 
-    if ((float)g_forwardEncoderTotal >= limit_float(g_straightDistancePulse, 0.0f, 30000.0f))
+    forwardAbs = absf_local((float)g_forwardEncoderTotal);
+
+    if ((g_taskState == TASK_STRAIGHT_AB) && g_task1UseLineStop)
+    {
+        App_Line_Update();
+        if (g_lineValid && (forwardAbs >= g_task1MinLinePulse))
+        {
+            Straight_Finish();
+            return;
+        }
+    }
+
+    if (forwardAbs >= limit_float(g_straightDistancePulse, 0.0f, 30000.0f))
     {
         Straight_Finish();
         return;
@@ -930,6 +1061,18 @@ static void Task2_SearchArcStart(float turnSign)
     g_arcRunMs = 0;
     g_arcStartYaw = g_yawDeg;
     g_arcDeltaYaw = 0.0f;
+    g_arcEntryTargetValid = 0U;
+
+    if (g_taskState == TASK2_SEARCH_ARC_BC)
+    {
+        g_arcEntryTargetYaw = wrap_180(g_yawDeg + g_task2BcEntryYaw);
+        g_arcEntryTargetValid = 1U;
+    }
+    else if (g_taskState == TASK2_SEARCH_ARC_DA)
+    {
+        g_arcEntryTargetYaw = wrap_180(g_yawDeg + g_task2DaEntryYaw);
+        g_arcEntryTargetValid = 1U;
+    }
 
     g_task2SearchStartPulse = (float)g_forwardEncoderTotal;
 
@@ -944,6 +1087,7 @@ static void Task2_StartTraceArc(void)
     /* 真正看到黑线后，才清零编码器，开始统计半圆弧段脉冲差。 */
     Encoder_ClearTotalsOnly();
 
+    g_arcEntryTargetValid = 0U;
     g_arcRunMs = 0;
     g_arcStartYaw = g_yawDeg;
     g_arcDeltaYaw = 0.0f;
@@ -993,8 +1137,7 @@ static void Task2_FinishAlign(void)
     {
         /* C 点补角完成后，进入 C->D 直线。Straight_Start 会清零编码器并锁当前 yaw。 */
         g_taskState = TASK2_STRAIGHT_CD;
-        g_straightDistancePulse = g_task2StraightToSearchPulse;
-        Straight_Start();
+        Straight_StartToYaw(wrap_180(g_taskStartYaw + 180.0f), g_task2StraightToSearchPulse);
 
         if (!g_straightActive)
         {
@@ -1023,7 +1166,14 @@ static void Task2_ControlSearch10ms(void)
     float searchDeltaPulse;
 
     if (g_arcRunMs < 60000U - CONTROL_PERIOD_MS) g_arcRunMs += CONTROL_PERIOD_MS;
-    g_arcDeltaYaw = wrap_180(g_yawDeg - g_arcStartYaw);
+    if (g_arcEntryTargetValid)
+    {
+        g_arcDeltaYaw = Nav_YawError(g_arcEntryTargetYaw);
+    }
+    else
+    {
+        g_arcDeltaYaw = wrap_180(g_yawDeg - g_arcStartYaw);
+    }
 
     /* SEARCH 阶段只读灰度，不调用普通循迹。
      * 因为刚从直线提前切入时还没接触黑线，丢线是正常状态。
@@ -1056,7 +1206,14 @@ static void Task2_ControlSearch10ms(void)
         return;
     }
 
-    Task2_ApplyYawStraightHold(g_task2SearchSpeed);
+    if (g_arcEntryTargetValid)
+    {
+        Task_ApplyYawEntryHold(g_arcEntryTargetYaw, g_entrySpeed);
+    }
+    else
+    {
+        Task2_ApplyYawStraightHold(g_task2SearchSpeed);
+    }
 }
 
 static void Task_TraceLineNoLost10ms(void)
@@ -1117,12 +1274,22 @@ static void Task_TraceLineNoLost10ms(void)
 static void Task2_ControlTrace10ms(void)
 {
     float forwardAbs;
+    float targetYaw;
 
     if (g_arcRunMs < 60000U - CONTROL_PERIOD_MS)
     {
         g_arcRunMs += CONTROL_PERIOD_MS;
     }
-    g_arcDeltaYaw = wrap_180(g_yawDeg - g_arcStartYaw);
+
+    if (g_taskState == TASK2_TRACE_ARC_BC)
+    {
+        targetYaw = wrap_180(g_taskStartYaw + g_task2BcExitYaw);
+    }
+    else
+    {
+        targetYaw = wrap_180(g_taskStartYaw + g_task2DaExitYaw);
+    }
+    g_arcDeltaYaw = Nav_YawError(targetYaw);
 
     /*
      * task2 半圆弧 TRACE 阶段只读取一次灰度。
@@ -1157,7 +1324,8 @@ static void Task2_ControlTrace10ms(void)
      */
     if ((g_arcRunMs >= g_arcMinTimeMs) &&
         (forwardAbs >= g_task2ArcMinForwardPulse) &&
-        (g_task2LineLostMs >= g_task2LineLostConfirmMs))
+        (g_task2LineLostMs >= g_task2LineLostConfirmMs) &&
+        Nav_YawInWindow(targetYaw, g_arcExitYawWindowDeg))
     {
         Task2_FinishTraceArc();
         return;
@@ -1190,6 +1358,11 @@ static void Task2_ControlWaitAlign10ms(void)
 
     if (g_taskState == TASK2_WAIT_ALIGN_C)
     {
+        Encoder_ClearTotalsOnly();
+        g_arcRunMs = 0;
+        g_arcStartYaw = g_yawDeg;
+        g_arcDeltaYaw = 0.0f;
+        App_Control_ResetPID();
         g_taskState = TASK2_ALIGN_C;
         g_targetForwardSpeed = 0.0f;
         g_targetTurnSpeed = 0.0f;
@@ -1200,6 +1373,11 @@ static void Task2_ControlWaitAlign10ms(void)
 
     if (g_taskState == TASK2_WAIT_ALIGN_A)
     {
+        Encoder_ClearTotalsOnly();
+        g_arcRunMs = 0;
+        g_arcStartYaw = g_yawDeg;
+        g_arcDeltaYaw = 0.0f;
+        App_Control_ResetPID();
         g_taskState = TASK2_ALIGN_A;
         g_targetForwardSpeed = 0.0f;
         g_targetTurnSpeed = 0.0f;
@@ -1211,26 +1389,22 @@ static void Task2_ControlWaitAlign10ms(void)
 
 static void Task2_ControlAlign10ms(void)
 {
-    int32_t wheelDiffAbs;
-    int32_t targetDiff;
-    float turnTarget;
+    float targetYaw;
 
-    wheelDiffAbs = abs_i32_local(Task2_GetWheelDiffPulse());
-    targetDiff = (int32_t)g_task2ArcWheelDiffTarget;
+    if (g_taskState == TASK2_ALIGN_C)
+    {
+        targetYaw = wrap_180(g_taskStartYaw + 180.0f);
+    }
+    else
+    {
+        targetYaw = g_taskStartYaw;
+    }
 
-    if (wheelDiffAbs >= targetDiff)
+    if (Nav_YawAlignControl10ms(targetYaw))
     {
         Task2_FinishAlign();
         return;
     }
-
-    if (g_taskState == TASK2_ALIGN_C) turnTarget = g_task2BcTurnSign * g_task2AlignTurnSpeed;
-    else turnTarget = g_task2DaTurnSign * g_task2AlignTurnSpeed;
-
-    g_targetForwardSpeed = slew_float(g_targetForwardSpeed, 0.0f, g_forwardSlewStep);
-    g_targetTurnSpeed = slew_float(g_targetTurnSpeed, turnTarget, g_turnSlewStep);
-    g_carEnable = 1;
-    g_lastCmdTickMs = 0;
 }
 
 static void Task2_Control10ms(void)
@@ -1311,6 +1485,18 @@ static void Task3_SearchArcStart(float turnSign)
     g_arcRunMs = 0;
     g_arcStartYaw = g_yawDeg;
     g_arcDeltaYaw = 0.0f;
+    g_arcEntryTargetValid = 0U;
+
+    if (g_taskState == TASK3_SEARCH_ARC_CB)
+    {
+        g_arcEntryTargetYaw = wrap_180(g_yawDeg + g_task3CbEntryYaw);
+        g_arcEntryTargetValid = 1U;
+    }
+    else if (g_taskState == TASK3_SEARCH_ARC_DA)
+    {
+        g_arcEntryTargetYaw = wrap_180(g_yawDeg + g_task3DaEntryYaw);
+        g_arcEntryTargetValid = 1U;
+    }
 
     g_task2SearchStartPulse = (float)g_forwardEncoderTotal;
 
@@ -1324,6 +1510,7 @@ static void Task3_StartTraceArc(void)
 {
     Encoder_ClearTotalsOnly();
 
+    g_arcEntryTargetValid = 0U;
     g_arcRunMs = 0;
     g_arcStartYaw = g_yawDeg;
     g_arcDeltaYaw = 0.0f;
@@ -1371,6 +1558,7 @@ static void Task3_StartTurnBD(void)
     g_arcRunMs = 0;
     g_arcStartYaw = g_yawDeg;
     g_arcDeltaYaw = 0.0f;
+    g_arcEntryTargetValid = 0U;
     g_task2LineValidMs = 0;
     g_task2LineLostMs = 0;
     g_task2AlignWaitMs = 0;
@@ -1382,8 +1570,7 @@ static void Task3_FinishTurnBD(void)
 {
     Control_ForcePWMZero();
     g_taskState = TASK3_STRAIGHT_BD;
-    g_straightDistancePulse = g_task3DiagToSearchPulse;
-    Straight_Start();
+    Straight_StartToYaw(wrap_180(g_taskStartYaw + g_task3BdYawDeg), g_task3DiagToSearchPulse);
 
     if (!g_straightActive)
     {
@@ -1419,7 +1606,14 @@ static void Task3_ControlSearch10ms(void)
     float searchDeltaPulse;
 
     if (g_arcRunMs < 60000U - CONTROL_PERIOD_MS) g_arcRunMs += CONTROL_PERIOD_MS;
-    g_arcDeltaYaw = wrap_180(g_yawDeg - g_arcStartYaw);
+    if (g_arcEntryTargetValid)
+    {
+        g_arcDeltaYaw = Nav_YawError(g_arcEntryTargetYaw);
+    }
+    else
+    {
+        g_arcDeltaYaw = wrap_180(g_yawDeg - g_arcStartYaw);
+    }
 
     App_Line_Update();
 
@@ -1448,7 +1642,14 @@ static void Task3_ControlSearch10ms(void)
         return;
     }
 
-    Task2_ApplyYawStraightHold(g_task2SearchSpeed);
+    if (g_arcEntryTargetValid)
+    {
+        Task_ApplyYawEntryHold(g_arcEntryTargetYaw, g_entrySpeed);
+    }
+    else
+    {
+        Task2_ApplyYawStraightHold(g_task2SearchSpeed);
+    }
 }
 
 static void Task3_TraceLineNoLost10ms(void)
@@ -1459,12 +1660,22 @@ static void Task3_TraceLineNoLost10ms(void)
 static void Task3_ControlTrace10ms(void)
 {
     float forwardAbs;
+    float targetYaw;
 
     if (g_arcRunMs < 60000U - CONTROL_PERIOD_MS)
     {
         g_arcRunMs += CONTROL_PERIOD_MS;
     }
-    g_arcDeltaYaw = wrap_180(g_yawDeg - g_arcStartYaw);
+
+    if (g_taskState == TASK3_TRACE_ARC_CB)
+    {
+        targetYaw = wrap_180(g_taskStartYaw + g_task3CbExitYaw);
+    }
+    else
+    {
+        targetYaw = wrap_180(g_taskStartYaw + g_task3DaExitYaw);
+    }
+    g_arcDeltaYaw = Nav_YawError(targetYaw);
 
     App_Line_Update();
     forwardAbs = absf_local((float)g_forwardEncoderTotal);
@@ -1489,7 +1700,8 @@ static void Task3_ControlTrace10ms(void)
 
     if ((g_arcRunMs >= g_arcMinTimeMs) &&
         (forwardAbs >= g_task2ArcMinForwardPulse) &&
-        (g_task2LineLostMs >= g_task2LineLostConfirmMs))
+        (g_task2LineLostMs >= g_task2LineLostConfirmMs) &&
+        Nav_YawInWindow(targetYaw, g_arcExitYawWindowDeg))
     {
         Task3_FinishTraceArc();
         return;
@@ -1519,6 +1731,11 @@ static void Task3_ControlWaitAlign10ms(void)
 
     if (g_taskState == TASK3_WAIT_ALIGN_B)
     {
+        Encoder_ClearTotalsOnly();
+        g_arcRunMs = 0;
+        g_arcStartYaw = g_yawDeg;
+        g_arcDeltaYaw = 0.0f;
+        App_Control_ResetPID();
         g_taskState = TASK3_ALIGN_B;
         g_targetForwardSpeed = 0.0f;
         g_targetTurnSpeed = 0.0f;
@@ -1529,6 +1746,11 @@ static void Task3_ControlWaitAlign10ms(void)
 
     if (g_taskState == TASK3_WAIT_ALIGN_A)
     {
+        Encoder_ClearTotalsOnly();
+        g_arcRunMs = 0;
+        g_arcStartYaw = g_yawDeg;
+        g_arcDeltaYaw = 0.0f;
+        App_Control_ResetPID();
         g_taskState = TASK3_ALIGN_A;
         g_targetForwardSpeed = 0.0f;
         g_targetTurnSpeed = 0.0f;
@@ -1540,52 +1762,31 @@ static void Task3_ControlWaitAlign10ms(void)
 
 static void Task3_ControlAlign10ms(void)
 {
-    int32_t wheelDiffAbs;
-    int32_t targetDiff;
-    float turnTarget;
+    float targetYaw;
 
-    wheelDiffAbs = abs_i32_local(Task2_GetWheelDiffPulse());
-    targetDiff = (int32_t)g_task2ArcWheelDiffTarget;
+    if (g_taskState == TASK3_ALIGN_B)
+    {
+        targetYaw = wrap_180(g_taskStartYaw + g_task3CbExitYaw);
+    }
+    else
+    {
+        targetYaw = wrap_180(g_taskStartYaw + g_task3DaExitYaw);
+    }
 
-    if (wheelDiffAbs >= targetDiff)
+    if (Nav_YawAlignControl10ms(targetYaw))
     {
         Task3_FinishAlign();
         return;
     }
-
-    if (g_taskState == TASK3_ALIGN_B) turnTarget = g_task3CbTurnSign * g_task2AlignTurnSpeed;
-    else turnTarget = g_task3DaTurnSign * g_task2AlignTurnSpeed;
-
-    g_targetForwardSpeed = slew_float(g_targetForwardSpeed, 0.0f, g_forwardSlewStep);
-    g_targetTurnSpeed = slew_float(g_targetTurnSpeed, turnTarget, g_turnSlewStep);
-    g_carEnable = 1;
-    g_lastCmdTickMs = 0;
 }
 
 static void Task3_ControlTurnBD10ms(void)
 {
-    int32_t wheelDiffAbs;
-    int32_t targetDiff;
-
-    if (g_arcRunMs < 60000U - CONTROL_PERIOD_MS)
-    {
-        g_arcRunMs += CONTROL_PERIOD_MS;
-    }
-    g_arcDeltaYaw = wrap_180(g_yawDeg - g_arcStartYaw);
-
-    wheelDiffAbs = abs_i32_local(Task2_GetWheelDiffPulse());
-    targetDiff = (int32_t)g_task3DiagTurnDiffTarget;
-
-    if (wheelDiffAbs >= targetDiff)
+    if (Nav_YawAlignControl10ms(wrap_180(g_taskStartYaw + g_task3BdYawDeg)))
     {
         Task3_FinishTurnBD();
         return;
     }
-
-    g_targetForwardSpeed = 0.0f;
-    g_targetTurnSpeed = g_task3BdTurnSign * g_task2AlignTurnSpeed;
-    g_carEnable = 1;
-    g_lastCmdTickMs = 0;
 }
 
 static void Task3_Control10ms(void)
@@ -1635,6 +1836,7 @@ static void Task_Reset(void)
     g_task2CurrentTurnSign = g_task2BcTurnSign;
     g_arcRunMs = 0;
     g_arcDeltaYaw = 0.0f;
+    g_arcEntryTargetValid = 0U;
 }
 
 static void Task_SelectTask1(void)
@@ -1715,10 +1917,10 @@ static void Task_StartSelected(void)
         /* task1：A->B 直线 100 cm，到 B 停车提示。
          * 仍使用已验证的 7030-170=6860 pulse 停止阈值。
          */
-        g_straightDistancePulse = Task_GetStraightStopThreshold(g_task1DistancePulse);
+        g_taskStartYaw = g_yawDeg;
         g_taskRunning = 1;
         g_taskState = TASK_STRAIGHT_AB;
-        Straight_Start();
+        Straight_StartToYaw(g_taskStartYaw, Task_GetStraightStopThreshold(g_task1DistancePulse));
 
         if (!g_straightActive)
         {
@@ -1731,10 +1933,10 @@ static void Task_StartSelected(void)
     if (g_taskSelected == 2U)
     {
         /* task2：使用编码器脉冲差架构。 */
-        g_straightDistancePulse = g_task2StraightToSearchPulse;
+        g_taskStartYaw = g_yawDeg;
         g_taskRunning = 1;
         g_taskState = TASK2_STRAIGHT_AB;
-        Straight_Start();
+        Straight_StartToYaw(g_taskStartYaw, g_task2StraightToSearchPulse);
 
         if (!g_straightActive)
         {
@@ -1747,10 +1949,10 @@ static void Task_StartSelected(void)
     /* task4 remains a no-motion placeholder. */
     if (g_taskSelected == 3U)
     {
-        g_straightDistancePulse = g_task3DiagToSearchPulse;
+        g_taskStartYaw = g_yawDeg;
         g_taskRunning = 1;
         g_taskState = TASK3_STRAIGHT_AC;
-        Straight_Start();
+        Straight_StartToYaw(wrap_180(g_taskStartYaw + g_task3AcYawDeg), g_task3DiagToSearchPulse);
 
         if (!g_straightActive)
         {
@@ -1770,6 +1972,7 @@ static void Task_Stop(void)
 {
     g_straightActive = 0;
     g_arcActive = 0;
+    g_arcEntryTargetValid = 0U;
     g_taskRunning = 0;
     g_taskState = TASK_IDLE;
     g_workMode = WORK_STANDBY;
@@ -1890,6 +2093,40 @@ static void Local_ExecuteSelectedTask(void)
     g_localMode = LOCAL_STANDBY;
     g_workMode = WORK_STANDBY;
     Task_StartSelected();
+}
+
+static uint8_t Local_IsCommandWaitState(void)
+{
+    return (uint8_t)(
+        !g_safetyLocked &&
+        !g_taskRunning &&
+        !g_straightActive &&
+        !g_arcActive &&
+        !TaskAuto_IsSpecialState() &&
+        g_workMode == WORK_STANDBY
+    );
+}
+
+static void Local_Sw4MpuDebugAndCalib(void)
+{
+    /*
+     * SW4 在等待命令阶段：
+     * 等价执行：
+     *   [key,mpuDebug,down]
+     *   [key,mpuCalib,down]
+     *
+     * 非等待阶段仍然保留原来的 K4 解锁/停车回待机功能。
+     */
+    if (!Local_IsCommandWaitState())
+    {
+        App_UnlockControl();
+        return;
+    }
+
+    Local_EnterMpuDebug();
+
+    g_plotMode = 2U;
+    MPU_CalibrateGyroZ();
 }
 
 /* ================================================================
@@ -2262,7 +2499,7 @@ static void Main_KeyProcess(void)
 
     if (key == 4U)
     {
-        App_UnlockControl();
+        Local_Sw4MpuDebugAndCalib();
         return;
     }
 }

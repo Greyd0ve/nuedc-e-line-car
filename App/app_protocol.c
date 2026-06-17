@@ -101,6 +101,34 @@ extern volatile float g_task3CbTurnSign;
 extern volatile float g_task3BdTurnSign;
 extern volatile float g_task3DaTurnSign;
 
+extern volatile float g_entrySpeed;
+extern volatile float g_entryYawKp;
+extern volatile float g_entryYawKd;
+extern volatile float g_entryTurnLimit;
+
+extern volatile float g_task2BcEntryYaw;
+extern volatile float g_task2DaEntryYaw;
+extern volatile float g_task3CbEntryYaw;
+extern volatile float g_task3DaEntryYaw;
+
+extern volatile float g_arcExitYawWindowDeg;
+
+extern volatile float g_task2BcExitYaw;
+extern volatile float g_task2DaExitYaw;
+extern volatile float g_task3CbExitYaw;
+extern volatile float g_task3DaExitYaw;
+
+extern volatile float g_yawAlignToleranceDeg;
+extern volatile float g_yawAlignTurnSpeed;
+extern volatile uint16_t g_yawAlignMaxMs;
+extern volatile float g_yawAlignMaxWheelDiff;
+
+extern volatile float g_task3AcYawDeg;
+extern volatile float g_task3BdYawDeg;
+
+extern volatile float g_task1MinLinePulse;
+extern volatile uint8_t g_task1UseLineStop;
+
 static float App_Protocol_LimitFloat(float value, float minVal, float maxVal)
 {
     if (value < minVal) return minVal;
@@ -452,6 +480,39 @@ static uint8_t App_Protocol_ApplySliderPacket(const char *name, float value)
     if (App_Protocol_IsName(name, "yawKp", "headingKp", "straightKp")) { if (!App_Protocol_SetFloatRange(&g_yawKp, value, 0.0f, 20.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
     if (App_Protocol_IsName(name, "yawKd", "headingKd", "straightKd")) { if (!App_Protocol_SetFloatRange(&g_yawKd, value, 0.0f, 10.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
     if (App_Protocol_IsName(name, "straightSpeed", "straightV", "lineV")) { if (!App_Protocol_SetFloatRange(&g_straightSpeed, value, 0.0f, 80.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
+
+    if (App_Protocol_IsName(name, "entrySpeed", "entryV", "arcEntrySpeed")) { if (!App_Protocol_SetFloatRange(&g_entrySpeed, value, 5.0f, 30.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
+    if (App_Protocol_IsName(name, "entryYawKp", "entryKp", "arcEntryKp")) { if (!App_Protocol_SetFloatRange(&g_entryYawKp, value, 0.0f, 8.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
+    if (App_Protocol_IsName(name, "entryYawKd", "entryKd", "arcEntryKd")) { if (!App_Protocol_SetFloatRange(&g_entryYawKd, value, 0.0f, 3.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
+    if (App_Protocol_IsName(name, "entryTurnLimit", "entryTurnMax", "arcEntryTurnLimit")) { if (!App_Protocol_SetFloatRange(&g_entryTurnLimit, value, 20.0f, 300.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
+
+    if (App_Protocol_IsName(name, "task2BcEntryYaw", "bcEntryYaw", "task2EntryBc")) { if (!App_Protocol_SetFloatRange(&g_task2BcEntryYaw, value, -80.0f, 80.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
+    if (App_Protocol_IsName(name, "task2DaEntryYaw", "daEntryYaw", "task2EntryDa")) { if (!App_Protocol_SetFloatRange(&g_task2DaEntryYaw, value, -80.0f, 80.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
+    if (App_Protocol_IsName(name, "task3CbEntryYaw", "cbEntryYaw", "task3EntryCb")) { if (!App_Protocol_SetFloatRange(&g_task3CbEntryYaw, value, -100.0f, 100.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
+    if (App_Protocol_IsName(name, "task3DaEntryYaw", "task3DaEntry", "task3EntryDa")) { if (!App_Protocol_SetFloatRange(&g_task3DaEntryYaw, value, -100.0f, 100.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
+
+    if (App_Protocol_IsName(name, "arcExitYawWindow", "exitYawWindow", "arcYawWindow")) { if (!App_Protocol_SetFloatRange(&g_arcExitYawWindowDeg, value, 10.0f, 90.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
+
+    if (App_Protocol_IsName(name, "task2BcExitYaw", "bcExitYaw", "task2ExitBc")) { if (!App_Protocol_SetFloatRange(&g_task2BcExitYaw, value, -180.0f, 180.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
+    if (App_Protocol_IsName(name, "task2DaExitYaw", "daExitYaw", "task2ExitDa")) { if (!App_Protocol_SetFloatRange(&g_task2DaExitYaw, value, -180.0f, 180.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
+    if (App_Protocol_IsName(name, "task3CbExitYaw", "cbExitYaw", "task3ExitCb")) { if (!App_Protocol_SetFloatRange(&g_task3CbExitYaw, value, -180.0f, 180.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
+    if (App_Protocol_IsName(name, "task3DaExitYaw", "task3DaExit", "task3ExitDa")) { if (!App_Protocol_SetFloatRange(&g_task3DaExitYaw, value, -180.0f, 180.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
+
+    if (App_Protocol_IsName(name, "yawAlignTol", "yawAlignTolerance", "alignYawTol")) { if (!App_Protocol_SetFloatRange(&g_yawAlignToleranceDeg, value, 1.0f, 15.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
+    if (App_Protocol_IsName(name, "yawAlignTurn", "yawAlignTurnSpeed", "alignYawTurn")) { if (!App_Protocol_SetFloatRange(&g_yawAlignTurnSpeed, value, 2.0f, 30.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
+    if (App_Protocol_IsName(name, "yawAlignMaxMs", "alignYawMaxMs", "yawAlignTime")) { if (!App_Protocol_SetUint16Range(&g_yawAlignMaxMs, value, 500.0f, 8000.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
+    if (App_Protocol_IsName(name, "yawAlignMaxDiff", "yawAlignMaxWheelDiff", "alignYawMaxDiff")) { if (!App_Protocol_SetFloatRange(&g_yawAlignMaxWheelDiff, value, 500.0f, 8000.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
+
+    if (App_Protocol_IsName(name, "task3AcYaw", "task3AcYawDeg", "acYaw")) { if (!App_Protocol_SetFloatRange(&g_task3AcYawDeg, value, -90.0f, 90.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
+    if (App_Protocol_IsName(name, "task3BdYaw", "task3BdYawDeg", "bdYaw")) { if (!App_Protocol_SetFloatRange(&g_task3BdYawDeg, value, 60.0f, 180.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
+
+    if (App_Protocol_IsName(name, "task1MinLinePulse", "task1LinePulse", "lineStopPulse")) { if (!App_Protocol_SetFloatRange(&g_task1MinLinePulse, value, 0.0f, 12000.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
+    if (App_Protocol_IsName(name, "task1UseLineStop", "task1LineStop", "lineStopEnable"))
+    {
+        if (value < 0.0f || value > 1.0f) { App_Protocol_RecordError(PROTO_ERR_RANGE, "range", 1U); return PROTO_RESULT_ERROR; }
+        g_task1UseLineStop = (value < 0.5f) ? 0U : 1U;
+        return App_Protocol_ResultOk(1U);
+    }
 
     if (App_Protocol_IsName(name, "task2SearchPulse", "searchPulse", "toArcPulse"))
     {
