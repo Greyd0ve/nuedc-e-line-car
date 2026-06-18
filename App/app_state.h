@@ -11,14 +11,11 @@ typedef enum
 typedef enum
 {
     LOCAL_STANDBY = 0,
-    LOCAL_ENCODER_DEBUG = 1,
-    LOCAL_MPU_DEBUG = 2
+    LOCAL_MPU_DEBUG = 1
 } LocalMode_t;
 
 void App_EmergencyStop(void);
 void App_UnlockControl(void);
-/* Compatibility shell only; Bluetooth remote driving is disabled. */
-void App_StartBluetoothMode(void);
 void App_StartTracingMode(void);
 
 #endif

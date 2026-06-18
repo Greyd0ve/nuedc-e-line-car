@@ -2,25 +2,27 @@
 #include "app_control.h"
 #include "app_line.h"
 #include "app_state.h"
+#if ENABLE_WEB_PID_DEBUG
 #include "Motor.h"
+#endif
 #include "PWM.h"
 #include "Serial.h"
 #include <stdint.h>
-#include <stdlib.h>
 
 #define PROTO_RESULT_ERROR      0U
 #define PROTO_RESULT_OK         1U
 #define PROTO_RESULT_IGNORED    2U
+#if ENABLE_WEB_PID_DEBUG
 #define PROTO_RESULT_NO_TICK    3U
 
 #define WEB_PID_TARGET_MIN      (-200.0f)
 #define WEB_PID_TARGET_MAX      (200.0f)
+#endif
 
 typedef enum
 {
     PROTO_ERR_FIELD = 0,
     PROTO_ERR_UNKNOWN,
-    PROTO_ERR_BAD_INT,
     PROTO_ERR_BAD_FLOAT,
     PROTO_ERR_RANGE,
     PROTO_ERR_TOO_LONG,
@@ -52,26 +54,29 @@ extern volatile float g_turnKd;
 extern volatile float g_maxForwardCmd;
 extern volatile float g_maxTurnCmd;
 
+#if ENABLE_WEB_PID_DEBUG
 extern volatile WorkMode_t g_workMode;
 extern volatile LocalMode_t g_localMode;
 extern volatile float g_targetForwardSpeed;
 extern volatile float g_targetTurnSpeed;
 extern volatile uint8_t g_carEnable;
+#endif
 extern volatile uint32_t g_lastCmdTickMs;
 extern volatile uint8_t g_safetyLocked;
 extern volatile float g_btSpeedLimitPercent;
 extern volatile float g_speedScale;
 extern volatile float g_pwmLimit;
 extern volatile uint8_t g_plotMode;
+#if ENABLE_WEB_PID_DEBUG
 extern volatile float g_speedPwm;
 extern volatile float g_diffPwm;
 extern volatile int16_t g_leftPwm;
 extern volatile int16_t g_rightPwm;
+#endif
 
 extern volatile uint32_t g_protoPacketOkCount;
 extern volatile uint32_t g_protoErrFieldCount;
 extern volatile uint32_t g_protoErrUnknownCount;
-extern volatile uint32_t g_protoErrBadIntCount;
 extern volatile uint32_t g_protoErrBadFloatCount;
 extern volatile uint32_t g_protoErrRangeCount;
 extern volatile uint32_t g_protoErrTooLongCount;
@@ -88,6 +93,7 @@ extern volatile float g_gyroZKalmanX;
 extern volatile uint8_t g_staticBiasTrackEnable;
 extern volatile float g_staticBiasAlpha;
 extern volatile float g_gyroZDeadbandDps;
+extern volatile float g_staticBiasGyroGateDps;
 extern volatile float g_yawKp;
 extern volatile float g_yawKd;
 extern volatile float g_straightSpeed;
@@ -186,7 +192,6 @@ static void App_Protocol_RecordError(ProtocolError_t err, const char *reason, ui
 {
     if (err == PROTO_ERR_FIELD) g_protoErrFieldCount++;
     else if (err == PROTO_ERR_UNKNOWN) g_protoErrUnknownCount++;
-    else if (err == PROTO_ERR_BAD_INT) g_protoErrBadIntCount++;
     else if (err == PROTO_ERR_BAD_FLOAT) g_protoErrBadFloatCount++;
     else if (err == PROTO_ERR_RANGE) g_protoErrRangeCount++;
     else if (err == PROTO_ERR_TOO_LONG) g_protoErrTooLongCount++;
@@ -194,8 +199,15 @@ static void App_Protocol_RecordError(ProtocolError_t err, const char *reason, ui
 
     if (report)
     {
+#if ENABLE_VERBOSE_STATUS
         Serial_Printf("[status,err,%s]\r\n", reason);
+#else
+        Serial_Printf("[err]\r\n");
+#endif
     }
+#if !ENABLE_VERBOSE_STATUS
+    (void)reason;
+#endif
 }
 
 static uint8_t App_Protocol_ResultOk(uint8_t report)
@@ -203,46 +215,91 @@ static uint8_t App_Protocol_ResultOk(uint8_t report)
     g_protoPacketOkCount++;
     if (report)
     {
+#if ENABLE_VERBOSE_STATUS
         Serial_Printf("[status,ok]\r\n");
+#else
+        Serial_Printf("[ok]\r\n");
+#endif
     }
     return PROTO_RESULT_OK;
 }
 
+#if ENABLE_WEB_PID_DEBUG
 static uint8_t App_Protocol_ResultNoTick(void)
 {
     g_protoPacketOkCount++;
     return PROTO_RESULT_NO_TICK;
 }
+#endif
 
 static uint8_t App_Protocol_ResultIgnored(const char *reason, uint8_t report)
 {
     if (report)
     {
+#if ENABLE_VERBOSE_STATUS
         Serial_Printf("[status,ignored,%s]\r\n", reason);
+#else
+        Serial_Printf("[ig]\r\n");
+#endif
     }
+#if !ENABLE_VERBOSE_STATUS
+    (void)reason;
+#endif
     return PROTO_RESULT_IGNORED;
 }
 
 static uint8_t App_Protocol_ParseFloat(const char *text, float *out)
 {
     const char *p;
-    char *endPtr;
-    double value;
+    float value;
+    float fracScale;
+    int sign;
+    uint8_t gotDigit;
 
     if (text == 0 || out == 0) return 0;
 
     p = App_Protocol_SkipSpace(text);
     if (*p == '\0') return 0;
 
-    value = strtod(p, &endPtr);
-    if (endPtr == p) return 0;
+    sign = 1;
+    if (*p == '-')
+    {
+        sign = -1;
+        p++;
+    }
+    else if (*p == '+')
+    {
+        p++;
+    }
 
-    endPtr = (char *)App_Protocol_SkipSpace(endPtr);
-    if (*endPtr != '\0') return 0;
-    if (value != value) return 0;
-    if (value > 1.0e30 || value < -1.0e30) return 0;
+    value = 0.0f;
+    gotDigit = 0U;
+    while (*p >= '0' && *p <= '9')
+    {
+        value = value * 10.0f + (float)(*p - '0');
+        p++;
+        gotDigit = 1U;
+        if (value > 1000000.0f) return 0;
+    }
 
-    *out = (float)value;
+    if (*p == '.')
+    {
+        p++;
+        fracScale = 0.1f;
+        while (*p >= '0' && *p <= '9')
+        {
+            value += (float)(*p - '0') * fracScale;
+            fracScale *= 0.1f;
+            p++;
+            gotDigit = 1U;
+        }
+    }
+
+    p = App_Protocol_SkipSpace(p);
+    if (*p != '\0') return 0;
+    if (!gotDigit) return 0;
+
+    *out = (sign < 0) ? -value : value;
     return 1;
 }
 
@@ -321,6 +378,7 @@ static void App_Protocol_ApplyFastPreset(void)
     App_ProtocolPromptStart(220);
 }
 
+#if ENABLE_WEB_PID_DEBUG
 static uint16_t App_Protocol_FloatToCent(float value)
 {
     if (value < 0.0f) value = 0.0f;
@@ -392,6 +450,7 @@ static uint8_t App_Protocol_WebPidStartControl(void)
     App_ProtocolPromptStart(160);
     return App_Protocol_ResultOk(1U);
 }
+#endif
 
 static uint8_t App_Protocol_ApplySliderPacket(const char *name, float value)
 {
@@ -412,7 +471,9 @@ static uint8_t App_Protocol_ApplySliderPacket(const char *name, float value)
     if (App_Protocol_IsName(name, "Kp", "speedKp", "forwardKp") || App_Protocol_StrEqualIgnoreCase(name, "fKp")) { if (!App_Protocol_SetFloatRange(&g_forwardKp, value, 0.0f, 80.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
     if (App_Protocol_IsName(name, "Ki", "speedKi", "forwardKi") || App_Protocol_StrEqualIgnoreCase(name, "fKi")) { if (!App_Protocol_SetFloatRange(&g_forwardKi, value, 0.0f, 20.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
     if (App_Protocol_IsName(name, "Kd", "speedKd", "forwardKd") || App_Protocol_StrEqualIgnoreCase(name, "fKd")) { if (!App_Protocol_SetFloatRange(&g_forwardKd, value, 0.0f, 30.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
+#if ENABLE_WEB_PID_DEBUG
     if (App_Protocol_IsName(name, "target", "targetSpeed", "speedTarget")) { if (!App_Protocol_SetFloatRange(&g_targetForwardSpeed, value, WEB_PID_TARGET_MIN, WEB_PID_TARGET_MAX)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
+#endif
     if (App_Protocol_IsName(name, "turnKp", "diffKp", "tKp")) { if (!App_Protocol_SetFloatRange(&g_turnKp, value, 0.0f, 80.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
     if (App_Protocol_IsName(name, "turnKi", "diffKi", "tKi")) { if (!App_Protocol_SetFloatRange(&g_turnKi, value, 0.0f, 20.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
     if (App_Protocol_IsName(name, "turnKd", "diffKd", "tKd")) { if (!App_Protocol_SetFloatRange(&g_turnKd, value, 0.0f, 30.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
@@ -475,6 +536,7 @@ static uint8_t App_Protocol_ApplySliderPacket(const char *name, float value)
     }
     if (App_Protocol_IsName(name, "staticBiasAlpha", "biasAlpha", "gyroBiasAlpha")) { if (!App_Protocol_SetFloatRange(&g_staticBiasAlpha, value, 0.990f, 0.9999f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
     if (App_Protocol_IsName(name, "gyroZDeadband", "gyroZDeadbandDps", "gyroDeadband")) { if (!App_Protocol_SetFloatRange(&g_gyroZDeadbandDps, value, 0.0f, 1.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
+    if (App_Protocol_IsName(name, "staticBiasGyroGate", "biasGyroGate", "gyroBiasGate")) { if (!App_Protocol_SetFloatRange(&g_staticBiasGyroGateDps, value, 0.02f, 2.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
     if (App_Protocol_IsName(name, "yawKp", "headingKp", "straightKp")) { if (!App_Protocol_SetFloatRange(&g_yawKp, value, 0.0f, 20.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
     if (App_Protocol_IsName(name, "yawKd", "headingKd", "straightKd")) { if (!App_Protocol_SetFloatRange(&g_yawKd, value, 0.0f, 10.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
     if (App_Protocol_IsName(name, "straightSpeed", "straightV", "lineV")) { if (!App_Protocol_SetFloatRange(&g_straightSpeed, value, 0.0f, 80.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
@@ -595,17 +657,17 @@ static uint8_t App_Protocol_ApplySliderPacket(const char *name, float value)
 
     if (App_Protocol_IsName(name, "plotMode", "debugMode", "dbg"))
     {
-        if (value < 0.0f || value > (float)PLOT_MODE_WEB_PID)
+        if (value < 0.0f || value > (float)PLOT_MODE_MAX)
         {
             App_Protocol_RecordError(PROTO_ERR_RANGE, "range", 1U);
             return PROTO_RESULT_ERROR;
         }
         if (value < 0.5f) g_plotMode = 0U;
-        else if (value < 1.5f) g_plotMode = 1U;
+        /* plotMode 1 was encoder debug; it is removed and maps to basic telemetry. */
+        else if (value < 1.5f) g_plotMode = 0U;
         else if (value < 2.5f) g_plotMode = 2U;
         else if (value < 3.5f) g_plotMode = 3U;
-        else if (value < 4.5f) g_plotMode = 4U;
-        else g_plotMode = PLOT_MODE_WEB_PID;
+        else g_plotMode = 4U;
         return App_Protocol_ResultOk(1U);
     }
 
@@ -613,13 +675,7 @@ static uint8_t App_Protocol_ApplySliderPacket(const char *name, float value)
     return PROTO_RESULT_ERROR;
 }
 
-static uint8_t App_Protocol_ApplyJoystickPacket(char **tok, int n)
-{
-    (void)tok;
-    (void)n;
-    return App_Protocol_ResultIgnored("joystick_remote_disabled", 1U);
-}
-
+#if ENABLE_WEB_PID_DEBUG
 static uint8_t App_Protocol_WebPidApplySet(const char *name, float value)
 {
     if (App_Protocol_IsName(name, "kp", "Kp", "speedKp"))
@@ -646,7 +702,9 @@ static uint8_t App_Protocol_WebPidApplySet(const char *name, float value)
     App_Protocol_RecordError(PROTO_ERR_UNKNOWN, "unknown", 1U);
     return PROTO_RESULT_ERROR;
 }
+#endif
 
+#if ENABLE_WEB_PID_DEBUG
 static uint8_t App_Protocol_ApplyPidPacket(char **tok, int n)
 {
     float value;
@@ -692,6 +750,7 @@ static uint8_t App_Protocol_ApplyPidPacket(char **tok, int n)
     App_Protocol_RecordError(PROTO_ERR_UNKNOWN, "unknown", 1U);
     return PROTO_RESULT_ERROR;
 }
+#endif
 
 static uint8_t App_Protocol_ApplyPacket(char *payload)
 {
@@ -734,6 +793,8 @@ static uint8_t App_Protocol_ApplyPacket(char *payload)
 
         if (App_Protocol_IsName(tok[1], "emergency", "emg", 0)) { App_EmergencyStop(); return App_Protocol_ResultOk(1U); }
         if (App_Protocol_IsName(tok[1], "unlock", "release", "resume")) { App_UnlockControl(); return App_Protocol_ResultOk(1U); }
+        if (App_Protocol_IsName(tok[1], "encClear", "encoderClear", "clearEnc")) { return App_Protocol_ResultIgnored("encoder_debug_removed", 1U); }
+        if (App_Protocol_IsName(tok[1], "encDebug", "encoderDebug", "encDbg")) { return App_Protocol_ResultIgnored("encoder_debug_removed", 1U); }
 
         if (g_safetyLocked)
         {
@@ -742,8 +803,6 @@ static uint8_t App_Protocol_ApplyPacket(char *payload)
         }
 
         if (App_Protocol_IsName(tok[1], "presetFast", "fast", "fastPreset")) { App_Protocol_ApplyFastPreset(); return App_Protocol_ResultOk(1U); }
-        if (App_Protocol_IsName(tok[1], "encClear", "encoderClear", "clearEnc")) { App_ProtocolEncoderDebugClearTotals(); return App_Protocol_ResultOk(1U); }
-        if (App_Protocol_IsName(tok[1], "encDebug", "encoderDebug", "encDbg")) { App_ProtocolEnterEncoderDebug(); return App_Protocol_ResultOk(1U); }
         if (App_Protocol_IsName(tok[1], "mpuDebug", "gyroDebug", "yawDebug")) { App_ProtocolEnterMpuDebug(); return App_Protocol_ResultOk(1U); }
         if (App_Protocol_IsName(tok[1], "mpuCalib", "gyroCalib", "calib")) { g_plotMode = 2U; App_ProtocolMpuCalibrateGyroZ(); return App_Protocol_ResultOk(1U); }
         if (App_Protocol_IsName(tok[1], "yawZero", "mpuZero", "zeroYaw")) { App_ProtocolMpuResetYaw(); App_ProtocolPromptStart(180); return App_Protocol_ResultOk(1U); }
@@ -752,18 +811,22 @@ static uint8_t App_Protocol_ApplyPacket(char *payload)
         if (App_Protocol_IsName(tok[1], "task3", "selectTask3", "t3")) { App_ProtocolSelectOnly(3U); App_ProtocolPromptStart(330); return App_Protocol_ResultOk(1U); }
         if (App_Protocol_IsName(tok[1], "task4", "selectTask4", "t4")) { App_ProtocolSelectOnly(4U); App_ProtocolPromptStart(400); return App_Protocol_ResultOk(1U); }
         if (App_Protocol_IsName(tok[1], "start", "run", "taskStart")) { App_ProtocolStartSelectedTask(); return App_Protocol_ResultOk(1U); }
-        if (App_Protocol_IsName(tok[1], "stop", "halt", "brake")) { return App_Protocol_ResultIgnored("remote_motion_key_disabled", 1U); }
+        if (App_Protocol_IsName(tok[1], "stop", "halt", "brake")) { return App_Protocol_ResultIgnored("ig", 1U); }
+#if ENABLE_WEB_PID_DEBUG
         if (App_Protocol_IsName(tok[1], "webStop", "pidStop", 0)) { App_Protocol_WebPidStopControl(); return App_Protocol_ResultOk(1U); }
+#endif
         if (App_Protocol_IsName(tok[1], "taskStop", "taskReset", "taskIdle")) { App_ProtocolTaskStop(); return App_Protocol_ResultOk(1U); }
+#if ENABLE_LEGACY_ARCTEST
         if (App_Protocol_IsName(tok[1], "arcTest", "arc", "arcRun")) { App_ProtocolTaskReset(); App_ProtocolArcStart(); return App_Protocol_ResultOk(1U); }
+#endif
         if (App_Protocol_IsName(tok[1], "tracing", "trace", "line")) { App_StartTracingMode(); return App_Protocol_ResultOk(1U); }
-        if (App_Protocol_IsName(tok[1], "Bluetooth", "BT", "remote")) { return App_Protocol_ResultIgnored("bluetooth_remote_disabled", 1U); }
+        if (App_Protocol_IsName(tok[1], "Bluetooth", "BT", "remote")) { return App_Protocol_ResultIgnored("ig", 1U); }
         if (App_Protocol_IsName(tok[1], "up", "forward", "fwd") ||
             App_Protocol_IsName(tok[1], "down", "backward", "back") ||
             App_Protocol_IsName(tok[1], "left", "right", 0) ||
             App_Protocol_IsName(tok[1], "speedUp", "speedDown", 0))
         {
-            return App_Protocol_ResultIgnored("remote_motion_key_disabled", 1U);
+            return App_Protocol_ResultIgnored("ig", 1U);
         }
 
         App_Protocol_RecordError(PROTO_ERR_UNKNOWN, "unknown", 1U);
@@ -787,13 +850,15 @@ static uint8_t App_Protocol_ApplyPacket(char *payload)
 
     if (App_Protocol_IsName(tok[0], "joystick", "j", 0))
     {
-        return App_Protocol_ApplyJoystickPacket(tok, n);
+        return PROTO_RESULT_IGNORED;
     }
 
+#if ENABLE_WEB_PID_DEBUG
     if (App_Protocol_IsName(tok[0], "pid", 0, 0))
     {
         return App_Protocol_ApplyPidPacket(tok, n);
     }
+#endif
 
     App_Protocol_RecordError(PROTO_ERR_UNKNOWN, "unknown", 1U);
     return PROTO_RESULT_ERROR;

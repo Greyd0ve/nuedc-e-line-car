@@ -1,3 +1,14 @@
+#include "BT_proto.h"
+
+/*
+ * Legacy Bluetooth remote parser is intentionally compiled out.
+ * The active serial protocol lives in App/app_protocol.c.
+ */
+void BT_Process(void)
+{
+}
+
+#if 0
 /*
  * 文件：Hardware/BT_proto.c
  * 作用：解析蓝牙串口小程序发送的数据包。
@@ -555,3 +566,4 @@ void BT_Process(void)
         }
     }
 }
+#endif

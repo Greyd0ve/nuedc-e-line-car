@@ -12,10 +12,11 @@
  *   3. 蓝牙串口仅用于参数调试、任务控制、MPU 校准和数据回传；
  *      不再支持蓝牙 joystick / 方向键遥控小车运动。
  *   4. 实体按键作为本地操作面板：
- *      K1：待机 -> 编码器调试 -> MPU 调试 -> 待机 循环切换。
+ *      K1：待机 -> MPU 调试 -> 待机 循环切换。
  *      K2：task1 -> task2 -> task3 -> task4 循环选择任务，只选择不启动。
- *      K3：待机状态执行当前任务；编码器调试清零脉冲；MPU 调试清零 yaw。
- *      K4：解除急停/锁定，PWM 清零，回到待机。
+ *      K3：待机状态执行当前任务；MPU 调试清零 yaw。
+ *      K4：等待命令阶段进入 MPU 调试并一键校准，随后关闭 staticBiasTrack 进入手动转角测试；
+ *          非等待阶段解除急停/锁定，PWM 清零，回到待机。
  *
  * task2_encoder_v2 架构保持前一版思路：
  *   A->B / C->D：MPU yaw 航向保持 + 左右轮平均脉冲判断距离。
@@ -43,7 +44,7 @@
  *   [key,emergency,down]   急停锁定
  *   [key,unlock,down]      解除急停
  *   [key,presetFast,down]  加载高速循迹参数
- *   [key,encDebug,down]    编码器调试回传
+ *   [key,encDebug,down]    已移除：编码器调试入口被忽略
  *   [key,mpuDebug,down]    MPU 调试回传
  *   [key,mpuCalib,down]    GyroZ 零偏校准
  *   [key,yawZero,down]     yaw 清零
@@ -77,7 +78,6 @@
 #include "../App/app_line.h"
 #include "../App/app_protocol.h"
 #include "../App/app_state.h"
-#include <stdio.h>
 #include <stdint.h>
 
 #ifndef GRAYSCALE_CHANNELS
@@ -93,6 +93,7 @@
 #define PLOT_REPORT_PERIOD_MS          100U
 #define OLED_REFRESH_PERIOD_MS         100U
 #define MPU_UPDATE_PERIOD_MS           10U
+#define ENABLE_OLED_TEXT_DEBUG         1U
 
 #define PWM_LIMIT_MAX                  ((float)PWM_MAX_DUTY)
 
@@ -211,8 +212,8 @@ volatile int32_t g_rightEncoderTotal = 0;
 volatile int32_t g_forwardEncoderTotal = 0;
 volatile int32_t g_turnEncoderTotal = 0;
 
-/* 0=普通回传，1=编码器调试，2=MPU调试，3=直线调试，4=弧线/task2调试 */
-/* Plot modes: 0=legacy [p] normal, 1=encoder, 2=MPU, 3=straight, 4=arc/task2, 5=web PID [plot]. */
+/* 0=普通回传，1=已废弃，2=MPU调试，3=直线调试，4=弧线/task调试 */
+/* Plot modes: 0=legacy [p] normal, 1=deprecated, 2=MPU, 3=straight, 4=arc/task, 5=web PID [plot]. */
 volatile uint8_t g_plotMode = 0;
 
 volatile float g_speedPwm = 0.0f;
@@ -267,6 +268,7 @@ volatile float g_gyroZKalmanX = 0.0f;
 volatile uint8_t g_staticBiasTrackEnable = 1U;
 volatile float g_staticBiasAlpha = 0.999f;
 volatile float g_gyroZDeadbandDps = 0.03f;
+volatile float g_staticBiasGyroGateDps = 0.15f;
 volatile float g_yawDeg = 0.0f;
 volatile float g_yawTotalDeg = 0.0f;
 
@@ -561,12 +563,6 @@ static void Encoder_ClearTotalsOnly(void)
     __enable_irq();
 }
 
-static void Encoder_DebugClearTotals(void)
-{
-    Encoder_ClearTotalsOnly();
-    Prompt_Start(180);
-}
-
 static int32_t Task2_GetWheelDiffPulse(void)
 {
     return g_rightEncoderTotal - g_leftEncoderTotal;
@@ -686,6 +682,7 @@ static uint8_t MPU_IsCarStaticForBiasUpdate(void)
     if (absf_local(g_targetTurnSpeed) > 0.5f) return 0U;
     if (absf_local(g_forwardSpeed) > 0.5f) return 0U;
     if (absf_local(g_turnSpeed) > 0.5f) return 0U;
+    if (absf_local(g_gyroZRawDps - g_gyroZBiasDps) > g_staticBiasGyroGateDps) return 0U;
 
     return 1U;
 }
@@ -1026,6 +1023,7 @@ static void Straight_Control10ms(void)
  * 13. arcTest 独立测试：保留旧 yaw 结束判断
  * ================================================================ */
 
+#if ENABLE_LEGACY_ARCTEST
 static void Arc_Start(void)
 {
     if (g_safetyLocked)
@@ -1096,6 +1094,7 @@ static void Arc_Control10ms(void)
 
     App_Line_TracingControl10ms();
 }
+#endif
 
 /* ================================================================
  * 14. task2_encoder_v1 状态机
@@ -2074,15 +2073,6 @@ static void Local_EnterStandby(void)
     Control_ForcePWMZero();
 }
 
-static void Local_EnterEncoderDebug(void)
-{
-    g_localMode = LOCAL_ENCODER_DEBUG;
-    g_workMode = WORK_STANDBY;
-    g_plotMode = 1U;
-    Control_ForcePWMZero();
-    Encoder_DebugClearTotals();
-}
-
 static void Local_EnterMpuDebug(void)
 {
     g_localMode = LOCAL_MPU_DEBUG;
@@ -2105,10 +2095,6 @@ static void Local_CycleMode(void)
     }
 
     if (g_localMode == LOCAL_STANDBY)
-    {
-        Local_EnterEncoderDebug();
-    }
-    else if (g_localMode == LOCAL_ENCODER_DEBUG)
     {
         Local_EnterMpuDebug();
     }
@@ -2158,17 +2144,11 @@ static void Local_ExecuteSelectedTask(void)
         return;
     }
 
-    if (g_localMode == LOCAL_ENCODER_DEBUG)
+    if (g_localMode == LOCAL_MPU_DEBUG)
     {
-        Encoder_DebugClearTotals();
+        MPU_ManualYawZero();
         return;
     }
-
-    if (g_localMode == LOCAL_MPU_DEBUG)
-		{
-				MPU_ManualYawZero();
-				return;
-		}
 
     g_localMode = LOCAL_STANDBY;
     g_workMode = WORK_STANDBY;
@@ -2190,10 +2170,10 @@ static uint8_t Local_IsCommandWaitState(void)
 static void Local_Sw4MpuDebugAndCalib(void)
 {
     /*
-     * SW4 在等待命令阶段：
-     * 等价执行：
-     *   [key,mpuDebug,down]
-     *   [key,mpuCalib,down]
+     * SW4/K4 在等待命令阶段：
+     *   进入 MPU 调试、停车、等待车体稳定、恢复推荐 MPU 参数、
+     *   执行 GyroZ 零偏校准、yaw 清零，然后关闭 staticBiasTrack，
+     *   便于手动转角测试。
      *
      * 非等待阶段仍然保留原来的 K4 解锁/停车回待机功能。
      */
@@ -2203,10 +2183,38 @@ static void Local_Sw4MpuDebugAndCalib(void)
         return;
     }
 
-    Local_EnterMpuDebug();
+    Control_ForcePWMZero();
+    Motor_StopAll();
+    App_Control_ResetPID();
 
+    Local_EnterMpuDebug();
     g_plotMode = 2U;
+
+    g_gyroZScale = 1.0f;
+    g_gyroZKalmanEnable = 1U;
+    g_gyroZKalmanQ = 0.02f;
+    g_gyroZKalmanR = 1.5f;
+    g_gyroZKalmanP = 1.0f;
+    g_gyroZKalmanX = g_gyroZRawDps;
+    g_gyroZDeadbandDps = 0.03f;
+    g_staticBiasAlpha = 0.999f;
+    g_staticBiasGyroGateDps = 0.15f;
+
+    Main_DelayMs(800);
+
+    g_staticBiasTrackEnable = 1U;
     MPU_CalibrateGyroZ();
+    if (g_mpuCalibrated)
+    {
+        MPU_ResetYaw();
+    }
+
+    g_staticBiasTrackEnable = 0U;
+    g_plotMode = 2U;
+    g_localMode = LOCAL_MPU_DEBUG;
+    g_workMode = WORK_STANDBY;
+
+    Prompt_Start(g_mpuCalibrated ? 300U : 900U);
 }
 
 /* ================================================================
@@ -2242,16 +2250,6 @@ void App_ProtocolForcePWMZero(void)
 void App_ProtocolPromptStart(uint16_t ms)
 {
     Prompt_Start(ms);
-}
-
-void App_ProtocolEncoderDebugClearTotals(void)
-{
-    Encoder_DebugClearTotals();
-}
-
-void App_ProtocolEnterEncoderDebug(void)
-{
-    Local_EnterEncoderDebug();
 }
 
 void App_ProtocolEnterMpuDebug(void)
@@ -2294,10 +2292,12 @@ void App_ProtocolTaskStop(void)
     Task_Stop();
 }
 
+#if ENABLE_LEGACY_ARCTEST
 void App_ProtocolArcStart(void)
 {
     Arc_Start();
 }
+#endif
 
 uint8_t App_ProtocolTask2IsSpecialState(void)
 {
@@ -2329,10 +2329,12 @@ static void Control_Run10ms(void)
     {
         Straight_Control10ms();
     }
+#if ENABLE_LEGACY_ARCTEST
     else if (g_arcActive)
     {
         Arc_Control10ms();
     }
+#endif
     else if (g_workMode == WORK_TRACING)
     {
         App_Line_TracingControl10ms();
@@ -2380,7 +2382,6 @@ static int ModeCode(void)
     if (g_taskState == TASK_FINISH) return 12;
     if (g_workMode == WORK_STANDBY)
     {
-        if (g_localMode == LOCAL_ENCODER_DEBUG) return 41;
         if (g_localMode == LOCAL_MPU_DEBUG) return 42;
         return 40;
     }
@@ -2402,7 +2403,6 @@ static char *ModeString(void)
     if (g_arcActive) return "ARC";
     if (g_workMode == WORK_TRACING) return "TRACE";
     if (g_workMode == WORK_BT) return "BT";
-    if (g_localMode == LOCAL_ENCODER_DEBUG) return "ENC";
     if (g_localMode == LOCAL_MPU_DEBUG) return "MPU";
     return "STBY";
 }
@@ -2410,22 +2410,6 @@ static char *ModeString(void)
 static void Serial_SendPlotStatus(void)
 {
     int modeCode = ModeCode();
-
-    if (g_plotMode == 1U)
-    {
-        Serial_Printf("[p,%d,%d,%d,%d,%d,%d,%d,%ld,%ld,%ld]\r\n",
-                      modeCode,
-                      (int)g_leftSpeed,
-                      (int)g_rightSpeed,
-                      (int)g_forwardSpeed,
-                      (int)g_turnSpeed,
-                      (int)g_targetForwardSpeed,
-                      (int)g_targetTurnSpeed,
-                      (long)g_leftEncoderTotal,
-                      (long)g_rightEncoderTotal,
-                      (long)g_forwardEncoderTotal);
-        return;
-    }
 
     if (g_plotMode == 2U)
     {
@@ -2475,6 +2459,7 @@ static void Serial_SendPlotStatus(void)
         return;
     }
 
+#if ENABLE_WEB_PID_DEBUG
     if (g_plotMode == PLOT_MODE_WEB_PID)
     {
         Serial_Printf("[plot,%d,%d,%d,%d]\r\n",
@@ -2484,6 +2469,7 @@ static void Serial_SendPlotStatus(void)
                       (int)g_speedPwm);
         return;
     }
+#endif
 
     Serial_Printf("[p,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d]\r\n",
                   modeCode,
@@ -2500,16 +2486,6 @@ static void Serial_SendPlotStatus(void)
 
 static void OLED_ShowStatus(void)
 {
-    if (g_plotMode == 1U)
-    {
-        OLED_Printf(0, 0, OLED_8X16, "ENC RP:%03d", (int)g_btSpeedLimitPercent);
-        OLED_Printf(0, 16, OLED_8X16, "Ld:%+04d Rd:%+04d", (int)g_leftSpeed, (int)g_rightSpeed);
-        OLED_Printf(0, 32, OLED_8X16, "L:%+06ld", (long)g_leftEncoderTotal);
-        OLED_Printf(0, 48, OLED_8X16, "R:%+06ld A:%+06ld", (long)g_rightEncoderTotal, (long)g_forwardEncoderTotal);
-        OLED_Update();
-        return;
-    }
-
     if (g_plotMode == 2U)
     {
         OLED_Printf(0, 0, OLED_8X16, "R:%d E:%02X ID:%02X", (int)g_mpuReady, (int)g_mpuErr, (int)g_mpuWhoAmI);
@@ -2554,10 +2530,10 @@ static void Main_KeyProcess(void)
 
     /*
      * 实体按键功能：
-     *   K1：本地模式循环：待机 -> 编码器调试 -> MPU 调试 -> 待机。
+     *   K1：本地模式循环：待机 -> MPU 调试 -> 待机。
      *   K2：任务选择循环：task1 -> task2 -> task3 -> task4。
-     *   K3：待机执行当前任务；编码器调试清零脉冲；MPU 调试清零 yaw。
-     *   K4：解锁小车，PWM 清零，回到待机。
+     *   K3：待机执行当前任务；MPU 调试清零 yaw。
+     *   K4：等待命令阶段一键 MPU 调试校准；非等待阶段解锁停车回待机。
      */
     if (key == 1U)
     {
@@ -2611,7 +2587,7 @@ int main(void)
 
     OLED_Printf(0, 0, OLED_8X16, "Local Standby");
     OLED_Printf(0, 16, OLED_8X16, "K1Mode K2Task");
-    OLED_Printf(0, 32, OLED_8X16, "K3Run  K4Unlock");
+    OLED_Printf(0, 32, OLED_8X16, "K3Run  K4MPU");
     OLED_Printf(0, 48, OLED_8X16, "Task:%d", (int)g_taskSelected);
     OLED_Update();
 
