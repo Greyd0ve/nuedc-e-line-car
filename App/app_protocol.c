@@ -128,6 +128,8 @@ extern volatile float g_arcExitYawWindowDeg;
 
 extern volatile float g_task2BcExitYaw;
 extern volatile float g_task2DaExitYaw;
+extern volatile float g_task2CAlignBiasDeg;
+extern volatile float g_task2AAlignBiasDeg;
 extern volatile float g_task3CbExitYaw;
 extern volatile float g_task3DaExitYaw;
 
@@ -556,6 +558,8 @@ static uint8_t App_Protocol_ApplySliderPacket(const char *name, float value)
 
     if (App_Protocol_IsName(name, "task2BcExitYaw", "bcExitYaw", "task2ExitBc")) { if (!App_Protocol_SetFloatRange(&g_task2BcExitYaw, value, -180.0f, 180.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
     if (App_Protocol_IsName(name, "task2DaExitYaw", "daExitYaw", "task2ExitDa")) { if (!App_Protocol_SetFloatRange(&g_task2DaExitYaw, value, -180.0f, 180.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
+    if (App_Protocol_IsName(name, "task2CAlignBias", "cAlignBias", "task2CBias")) { if (!App_Protocol_SetFloatRange(&g_task2CAlignBiasDeg, value, -10.0f, 10.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
+    if (App_Protocol_IsName(name, "task2AAlignBias", "aAlignBias", "task2ABias")) { if (!App_Protocol_SetFloatRange(&g_task2AAlignBiasDeg, value, -10.0f, 10.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
     if (App_Protocol_IsName(name, "task3CbExitYaw", "cbExitYaw", "task3ExitCb")) { if (!App_Protocol_SetFloatRange(&g_task3CbExitYaw, value, -180.0f, 180.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
     if (App_Protocol_IsName(name, "task3DaExitYaw", "task3DaExit", "task3ExitDa")) { if (!App_Protocol_SetFloatRange(&g_task3DaExitYaw, value, -180.0f, 180.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
 

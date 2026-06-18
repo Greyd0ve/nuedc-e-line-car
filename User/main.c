@@ -1,6 +1,6 @@
 /*
  * 文件：User/main.c
- * 版本：task2_encoder_v2_local_keys
+ * 版本：h_auto_local_keys
  *
  * 适用硬件：
  *   STM32F103C8T6 小车训练板，标准外设库风格代码。
@@ -15,27 +15,36 @@
  *      K1：待机 -> MPU 调试 -> 待机 循环切换。
  *      K2：task1 -> task2 -> task3 -> task4 循环选择任务，只选择不启动。
  *      K3：待机状态执行当前任务；MPU 调试清零 yaw。
- *      K4：等待命令阶段进入 MPU 调试并一键校准，随后关闭 staticBiasTrack 进入手动转角测试；
+ *      K4：等待命令阶段进入 MPU 调试并一键校准，staticBiasTrack 默认保持开启；
  *          非等待阶段解除急停/锁定，PWM 清零，回到待机。
  *
- * task2_encoder_v2 架构保持前一版思路：
- *   A->B / C->D：MPU yaw 航向保持 + 左右轮平均脉冲判断距离。
- *   直线到 6500 pulse 后提前进入 SEARCH_ARC，继续直行找半圆弧黑线，此时丢线正常。
- *   看到黑线后进入 TRACE_ARC，使用八路灰度循迹跑半圆弧。
- *   已经见线后连续丢线，认为离开半圆弧。
- *   出弯后进入 ALIGN，用左右轮脉冲差补足到约 2850 pulse，再进入下一段直线。
+ * task2 当前策略：
+ *   A->B / C->D：MPU yaw 航向保持 + 编码器距离判断。
+ *   SEARCH_ARC：MPU yaw 目标角硬切入，同时读取八路灰度找黑线。
+ *   TRACE_ARC：八路灰度循迹。
+ *   出弯判断：最小弧线脉冲 + 连续丢线确认 + yaw 窗口。
+ *   WAIT_ALIGN：短暂停车等待。
+ *   ALIGN：MPU yaw 补角到下一段目标方向。
+ *
+ * task3 当前策略：
+ *   A->C：MPU yaw 几何目标角 task3AcYaw + 编码器距离。
+ *   C->B：入弯找线 + 灰度循迹 + yaw 窗口出弯。
+ *   B 点：yaw 补角后进入 B->D。
+ *   B->D：先 yaw 转向 task3BdYaw，再直线闭环。
+ *   D->A：入弯找线 + 灰度循迹 + yaw 窗口出弯。
+ *   A 点：yaw 补角并结束，task4 模式下则计圈进入下一圈。
  *
  * task2 状态顺序：
  *   TASK2_STRAIGHT_AB     A -> B 直线，平均脉冲到 task2SearchPulse 后提前找线
  *   TASK2_SEARCH_ARC_BC   继续直行，允许丢线，直到检测到 B->C 半圆弧黑线
  *   TASK2_TRACE_ARC_BC    灰度循迹跑 B->C 半圆弧
  *   TASK2_WAIT_ALIGN_C    C 出弯丢线后立即停车等待 0.5s
- *   TASK2_ALIGN_C         等待结束后补角，直到左右轮脉冲差达到 arcWheelDiff
+ *   TASK2_ALIGN_C         等待结束后用 MPU yaw 补角到 C->D 方向
  *   TASK2_STRAIGHT_CD     C -> D 直线，平均脉冲到 task2SearchPulse 后提前找线
  *   TASK2_SEARCH_ARC_DA   继续直行，允许丢线，直到检测到 D->A 半圆弧黑线
  *   TASK2_TRACE_ARC_DA    灰度循迹跑 D->A 半圆弧
  *   TASK2_WAIT_ALIGN_A    A 出弯丢线后立即停车等待 0.5s
- *   TASK2_ALIGN_A         等待结束后补角，到达 arcWheelDiff 后结束 task2
+ *   TASK2_ALIGN_A         等待结束后用 MPU yaw 补角到 A 点终止方向
  *   TASK2_FINISH          停车并声光提示
  *
  * 网页命令保留：
@@ -43,23 +52,25 @@
  *   [key,tracing,down]     进入普通循迹模式
  *   [key,emergency,down]   急停锁定
  *   [key,unlock,down]      解除急停
- *   [key,presetFast,down]  加载高速循迹参数
+ *   [key,presetFast,down]  恢复默认高速循迹参数
  *   [key,encDebug,down]    已移除：编码器调试入口被忽略
  *   [key,mpuDebug,down]    MPU 调试回传
  *   [key,mpuCalib,down]    GyroZ 零偏校准
  *   [key,yawZero,down]     yaw 清零
- *   [key,task1/2,down]     网页选择任务
+ *   [key,task1/2/3/4,down] 网页选择任务
  *   [key,start,down]       网页启动已选择任务
  *   [key,taskStop,down]    中止任务并回待机
+ *   [slider,...]           保留网页调参
+ *   [joystick,...]         已禁用：不控制小车
  *
  * task2 可调参数：
  *   [slider,task2SearchPulse,6500]  直线提前找弧线阈值，单位 pulse
- *   [slider,arcWheelDiff,2850]      半圆弧左右轮脉冲差目标，单位 pulse
+ *   [slider,arcWheelDiff,2850]      兼容保留参数，主线补角已改用 yaw
  *   [slider,arcMinPulse,6500]       弧线最小平均脉冲，防止中途误判丢线
  *   [slider,arcFoundMs,80]          找到黑线确认时间，单位 ms
  *   [slider,arcLostMs,0]            离开黑线确认时间，单位 ms；0 表示满足出弯条件后丢线立即补角
  *   [slider,toArcSpeed,12]          SEARCH_ARC 直行找线速度
- *   [slider,alignTurn,12]           出弯补角转向速度
+ *   [slider,alignTurn,12]           兼容保留参数，主线补角转速用 yawAlignTurn
  *   [slider,bcTurnSign,-1]          B->C 补角方向符号
  *   [slider,daTurnSign,1]           D->A 补角方向符号
  */
@@ -160,7 +171,7 @@ typedef enum
     TASK_STOP_AT_B,
     TASK_FINISH,
 
-    /* task2_encoder_v1 专用状态 */
+    /* task2 自动路径状态 */
     TASK2_STRAIGHT_AB,
     TASK2_SEARCH_ARC_BC,
     TASK2_TRACE_ARC_BC,
@@ -309,7 +320,7 @@ volatile float g_task1MinLinePulse = 4000.0f;
 volatile uint8_t g_task1UseLineStop = 1U;
 
 /* ================================================================
- * 5. task2_encoder_v1 新参数
+ * 5. task2/task3 自动路径参数
  * ================================================================ */
 
 /* A->B、C->D 提前进入 SEARCH_ARC 的平均脉冲阈值。
@@ -317,9 +328,8 @@ volatile uint8_t g_task1UseLineStop = 1U;
  */
 volatile float g_task2StraightToSearchPulse = 6500.0f;
 
-/* 半圆弧理论左右轮脉冲差。
- * 你的轮距初值约 B=(14.7+11.1)/2=12.9 cm，pulsePerCm=70.30：
- * diff = 12.9*pi*70.30 ≈ 2850 pulse。
+/* 兼容保留的半圆弧理论左右轮脉冲差参数。
+ * 当前主线出弯后使用 MPU yaw 补角，轮差主要用于保护和调试观察。
  */
 volatile float g_task2ArcWheelDiffTarget = 2800.0f;
 
@@ -335,7 +345,7 @@ volatile uint16_t g_task2LineLostConfirmMs = 0U;
 /* SEARCH_ARC 阶段：继续按直线 yaw 低速前进找半圆弧黑线。 */
 volatile float g_task2SearchSpeed = 20.0f;
 
-/* ALIGN 阶段：补足左右轮脉冲差时的目标转向速度。 */
+/* 兼容保留参数；当前主线 ALIGN 转速使用 yawAlignTurn。 */
 volatile float g_task2AlignTurnSpeed = 12.0f;
 
 /* SEARCH_ARC 安全保护：提前找线后，如果又走了这么多脉冲还没找到线，则停车。 */
@@ -371,8 +381,8 @@ volatile float g_entryYawKp = 1.8f;
 volatile float g_entryYawKd = 0.15f;
 volatile float g_entryTurnLimit = 120.0f;
 
-volatile float g_task2BcEntryYaw = -20.0f;
-volatile float g_task2DaEntryYaw = 20.0f;
+volatile float g_task2BcEntryYaw = -5.0f;
+volatile float g_task2DaEntryYaw = 5.0f;
 volatile float g_task3CbEntryYaw = -60.0f;
 volatile float g_task3DaEntryYaw = 60.0f;
 
@@ -383,6 +393,8 @@ volatile float g_arcExitYawWindowDeg = 45.0f;
 
 volatile float g_task2BcExitYaw = 180.0f;
 volatile float g_task2DaExitYaw = 0.0f;
+volatile float g_task2CAlignBiasDeg = 0.0f;
+volatile float g_task2AAlignBiasDeg = 0.0f;
 volatile float g_task3CbExitYaw = 150.0f;
 volatile float g_task3DaExitYaw = 0.0f;
 
@@ -391,7 +403,7 @@ volatile float g_yawAlignTurnSpeed = 8.0f;
 volatile uint16_t g_yawAlignMaxMs = 2500U;
 volatile float g_yawAlignMaxWheelDiff = 3600.0f;
 
-volatile float g_task3AcYawDeg = 39.0f;
+volatile float g_task3AcYawDeg = -39.0f;
 volatile float g_task3BdYawDeg = 135.0f;
 
 /* ================================================================
@@ -656,6 +668,17 @@ static void MPU_ResetYaw(void)
 {
     g_yawDeg = 0.0f;
     g_yawTotalDeg = 0.0f;
+}
+
+static void MPU_ForceYaw(float yaw)
+{
+    yaw = wrap_180(yaw);
+
+    g_yawDeg = yaw;
+    g_yawTotalDeg = yaw;
+    g_gyroZDps = 0.0f;
+    g_gyroZKalmanX = g_gyroZRawDps;
+    g_gyroZKalmanP = 1.0f;
 }
 
 static float Kalman1D_GyroZUpdate(float z)
@@ -1102,7 +1125,7 @@ static void Arc_Control10ms(void)
 #endif
 
 /* ================================================================
- * 14. task2_encoder_v1 状态机
+ * 14. task2/task3 自动路径状态机
  * ================================================================ */
 
 static uint8_t Task2_IsSearchState(void)
@@ -1420,6 +1443,8 @@ static void Task2_ControlTrace10ms(void)
 
 static void Task2_ControlWaitAlign10ms(void)
 {
+    float targetYaw;
+
     /* 出弯后强制停车等待 0.5s。 */
     g_targetForwardSpeed = 0.0f;
     g_targetTurnSpeed = 0.0f;
@@ -1442,6 +1467,9 @@ static void Task2_ControlWaitAlign10ms(void)
 
     if (g_taskState == TASK2_WAIT_ALIGN_C)
     {
+        targetYaw = wrap_180(g_taskStartYaw + 180.0f);
+        MPU_ForceYaw(wrap_180(targetYaw - g_task2CAlignBiasDeg));
+
         Encoder_ClearTotalsOnly();
         g_arcRunMs = 0;
         g_arcStartYaw = g_yawDeg;
@@ -1457,6 +1485,9 @@ static void Task2_ControlWaitAlign10ms(void)
 
     if (g_taskState == TASK2_WAIT_ALIGN_A)
     {
+        targetYaw = wrap_180(g_taskStartYaw + 0.0f);
+        MPU_ForceYaw(wrap_180(targetYaw - g_task2AAlignBiasDeg));
+
         Encoder_ClearTotalsOnly();
         g_arcRunMs = 0;
         g_arcStartYaw = g_yawDeg;
@@ -2232,8 +2263,7 @@ static void Local_Sw4MpuDebugAndCalib(void)
     /*
      * SW4/K4 在等待命令阶段：
      *   进入 MPU 调试、停车、等待车体稳定、恢复推荐 MPU 参数、
-     *   执行 GyroZ 零偏校准、yaw 清零，然后关闭 staticBiasTrack，
-     *   便于手动转角测试。
+     *   执行 GyroZ 零偏校准、yaw 清零，并保持 staticBiasTrack 开启。
      *
      * 非等待阶段仍然保留原来的 K4 解锁/停车回待机功能。
      */
@@ -2269,7 +2299,12 @@ static void Local_Sw4MpuDebugAndCalib(void)
         MPU_ResetYaw();
     }
 
-    g_staticBiasTrackEnable = 0U;
+    /*
+     * 比赛/任务运行默认保持静止零偏跟踪开启。
+     * 如需手动转圈标定 gyroZScale，可通过网页临时发送：
+     * [slider,staticBiasTrack,0]
+     */
+    g_staticBiasTrackEnable = 1U;
     g_plotMode = 2U;
     g_localMode = LOCAL_MPU_DEBUG;
     g_workMode = WORK_STANDBY;
@@ -2538,12 +2573,58 @@ static void Serial_SendPlotStatus(void)
                   (int)g_lineValid);
 }
 
+static void OLED_Show2Digit(uint8_t x, uint8_t y, uint8_t value)
+{
+    if (value > 99U) value = 99U;
+    OLED_ShowChar(x, y, (char)('0' + value / 10U), OLED_8X16);
+    OLED_ShowChar((int16_t)(x + 8U), y, (char)('0' + value % 10U), OLED_8X16);
+}
+
+static void OLED_ShowSignedYaw(uint8_t x, uint8_t y, int yaw)
+{
+    uint16_t absYaw;
+
+    if (yaw > 180) yaw = 180;
+    if (yaw < -180) yaw = -180;
+
+    if (yaw < 0)
+    {
+        OLED_ShowChar(x, y, '-', OLED_8X16);
+        absYaw = (uint16_t)(-yaw);
+    }
+    else
+    {
+        OLED_ShowChar(x, y, '+', OLED_8X16);
+        absYaw = (uint16_t)yaw;
+    }
+
+    OLED_ShowChar((int16_t)(x + 8U), y, (char)('0' + (absYaw / 100U) % 10U), OLED_8X16);
+    OLED_ShowChar((int16_t)(x + 16U), y, (char)('0' + (absYaw / 10U) % 10U), OLED_8X16);
+    OLED_ShowChar((int16_t)(x + 24U), y, (char)('0' + absYaw % 10U), OLED_8X16);
+}
+
 static void OLED_ShowStatus(void)
 {
-    OLED_Printf(0, 0, OLED_8X16, "MODE:%-4s", ModeString());
-    OLED_Printf(0, 16, OLED_8X16, "TASK:%d", (int)g_taskSelected);
-    OLED_Printf(0, 32, OLED_8X16, "STATE:%02d", ModeCode());
-    OLED_Printf(0, 48, OLED_8X16, "YAW:%+04d", (int)g_yawDeg);
+    int state;
+    uint8_t task;
+
+    state = ModeCode();
+    if (state < 0) state = 0;
+    if (state > 99) state = 99;
+
+    task = g_taskSelected;
+    if (task < 1U) task = 1U;
+    if (task > 9U) task = 9U;
+
+    OLED_Clear();
+    OLED_ShowString(0, 0, "MODE:", OLED_8X16);
+    OLED_ShowString(40, 0, ModeString(), OLED_8X16);
+    OLED_ShowString(0, 16, "TASK:", OLED_8X16);
+    OLED_ShowChar(40, 16, (char)('0' + task), OLED_8X16);
+    OLED_ShowString(0, 32, "STATE:", OLED_8X16);
+    OLED_Show2Digit(48, 32, (uint8_t)state);
+    OLED_ShowString(0, 48, "YAW:", OLED_8X16);
+    OLED_ShowSignedYaw(32, 48, (int)g_yawDeg);
     OLED_Update();
 }
 
