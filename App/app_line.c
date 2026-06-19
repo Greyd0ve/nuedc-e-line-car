@@ -20,23 +20,12 @@
 extern volatile float g_lineBlackLevelF;
 extern volatile float g_lineReverseOrderF;
 extern volatile float g_lineTurnSign;
-extern volatile float g_traceBaseSpeed;
-extern volatile float g_traceSearchSpeed;
 extern volatile float g_lineKp;
 extern volatile float g_lineKd;
 extern volatile float g_lineTurnLimit;
-extern volatile float g_lineLostTurn;
 extern volatile float g_lineFilterAlpha;
-extern volatile float g_lineSlowGain;
 extern volatile float g_lineEdgeTurnExtra;
-extern volatile float g_lineEdgeSpeedRatio;
 extern volatile float g_lineMinTurn;
-extern volatile float g_forwardSlewStep;
-extern volatile float g_turnSlewStep;
-extern volatile float g_speedScale;
-extern volatile float g_pwmLimit;
-extern volatile float g_targetForwardSpeed;
-extern volatile float g_targetTurnSpeed;
 
 extern volatile int16_t g_lineError;
 extern volatile uint8_t g_lineValid;
@@ -44,8 +33,6 @@ extern volatile uint8_t g_lineMask;
 extern volatile uint8_t g_lineRawMask;
 extern volatile int8_t g_lastLineDir;
 extern volatile uint16_t g_lineLostMs;
-extern volatile uint8_t g_carEnable;
-extern volatile uint32_t g_lastCmdTickMs;
 
 static volatile float g_lineErrorFiltered = 0.0f;
 static volatile float g_lineLastCtrlError = 0.0f;
@@ -60,14 +47,6 @@ static float App_Line_LimitFloat(float value, float minVal, float maxVal)
     if (value < minVal) return minVal;
     if (value > maxVal) return maxVal;
     return value;
-}
-
-static float App_Line_SlewFloat(float current, float target, float maxStep)
-{
-    if (maxStep <= 0.0f) return target;
-    if (target > current + maxStep) return current + maxStep;
-    if (target < current - maxStep) return current - maxStep;
-    return target;
 }
 
 void App_Line_GPIOForceInit(void)
@@ -226,52 +205,4 @@ float App_Line_CalcTurnCmd(void)
     }
 
     return App_Line_LimitFloat(turn, -g_lineTurnLimit, g_lineTurnLimit);
-}
-
-void App_Line_TracingControl10ms(void)
-{
-    float forward;
-    float turn;
-
-    App_Line_Update();
-
-    if (g_speedScale <= 0.01f || g_pwmLimit <= 0.5f)
-    {
-        g_targetForwardSpeed = 0.0f;
-        g_targetTurnSpeed = 0.0f;
-        g_carEnable = 0;
-        return;
-    }
-
-    if (g_lineValid)
-    {
-        float e;
-        float slowRatio;
-        float minForward;
-
-        e = App_Line_AbsFloat((float)g_lineError) / 350.0f;
-        if (e > 1.0f) e = 1.0f;
-
-        slowRatio = 1.0f - App_Line_LimitFloat(g_lineSlowGain, 0.0f, 0.95f) * e;
-        if ((g_lineMask & 0xC3U) != 0U)
-        {
-            slowRatio *= App_Line_LimitFloat(g_lineEdgeSpeedRatio, 0.05f, 1.0f);
-        }
-
-        forward = g_traceBaseSpeed * g_speedScale * slowRatio;
-        minForward = g_traceSearchSpeed * g_speedScale;
-        if (forward < minForward) forward = minForward;
-
-        turn = App_Line_CalcTurnCmd() * g_speedScale;
-    }
-    else
-    {
-        forward = g_traceSearchSpeed * g_speedScale;
-        turn = (-g_lineTurnSign) * (float)g_lastLineDir * g_lineLostTurn * g_speedScale;
-    }
-
-    g_targetForwardSpeed = App_Line_SlewFloat(g_targetForwardSpeed, forward, g_forwardSlewStep);
-    g_targetTurnSpeed = App_Line_SlewFloat(g_targetTurnSpeed, turn, g_turnSlewStep);
-    g_carEnable = 1;
-    g_lastCmdTickMs = 0;
 }

@@ -4,8 +4,7 @@
 typedef enum
 {
     WORK_STANDBY = 0,
-    WORK_BT = 1,
-    WORK_TRACING = 2
+    WORK_BT = 1
 } WorkMode_t;
 
 typedef enum
@@ -16,6 +15,5 @@ typedef enum
 
 void App_EmergencyStop(void);
 void App_UnlockControl(void);
-void App_StartTracingMode(void);
 
 #endif

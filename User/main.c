@@ -62,7 +62,6 @@
 
 #define CONTROL_PERIOD_MS              10U
 #define BT_TIMEOUT_MS                  600U
-#define PLOT_REPORT_PERIOD_MS          500U
 #define OLED_REFRESH_PERIOD_MS         200U
 #define MPU_UPDATE_PERIOD_MS           10U
 #define ENABLE_OLED_TEXT_DEBUG         1U
@@ -97,7 +96,6 @@ volatile float g_traceSearchSpeed = 8.0f;
 volatile float g_lineKp = 0.350f;
 volatile float g_lineKd = 0.600f;
 volatile float g_lineTurnLimit = 180.0f;
-volatile float g_lineLostTurn = 130.0f;
 volatile float g_lineFilterAlpha = 0.58f;
 volatile float g_lineSlowGain = 0.88f;
 volatile float g_lineEdgeTurnExtra = 82.0f;
@@ -190,19 +188,11 @@ volatile int32_t g_rightEncoderTotal = 0;
 volatile int32_t g_forwardEncoderTotal = 0;
 volatile int32_t g_turnEncoderTotal = 0;
 
-/* 0=普通回传，1=已废弃，2=MPU调试，3=直线调试，4=弧线/task调试 */
-/* Plot modes: 0=legacy [p] normal, 1=deprecated, 2=MPU, 3=straight, 4=arc/task, 5=web PID [plot]. */
-volatile uint8_t g_plotMode = 0;
-
 volatile float g_speedPwm = 0.0f;
 volatile float g_diffPwm = 0.0f;
 volatile int16_t g_leftPwm = 0;
 volatile int16_t g_rightPwm = 0;
 volatile float g_forwardSpeedError = 0.0f;
-
-/* 保留该变量，用于兼容旧版 BT_proto.c 的链接引用。 */
-volatile uint8_t g_sendPlot = 0;
-volatile uint16_t g_sendDisplay = 0;
 
 volatile uint32_t g_protoPacketOkCount = 0;
 volatile uint32_t g_protoErrFieldCount = 0;
@@ -214,7 +204,6 @@ volatile uint32_t g_protoErrTooLongCount = 0;
 volatile uint32_t g_protoErrLockedCount = 0;
 
 volatile uint16_t g_oledRefreshMs = 0;
-volatile uint16_t g_plotReportMs = 0;
 volatile uint16_t g_mpuUpdateMs = 0;
 
 volatile int16_t g_lineError = 0;
@@ -866,14 +855,12 @@ static void Straight_Start(void)
 
     if (!g_mpuReady || !g_mpuCalibrated)
     {
-        g_plotMode = 2U;
         Control_ForcePWMZero();
         Prompt_Start(900);
         return;
     }
 
     g_workMode = WORK_BT;
-    g_plotMode = 3U;
     g_straightDone = 0;
 
     Control_ForcePWMZero();
@@ -940,7 +927,6 @@ static void Straight_Finish(void)
         Control_ForcePWMZero();
         g_taskRunning = 0;
         g_taskState = TASK_FINISH;
-        g_plotMode = 3U;
         Prompt_Start(800);
         return;
     }
@@ -974,7 +960,6 @@ static void Straight_Finish(void)
         g_arcEntryTargetValid = 0U;
         g_taskState = TASK3_WAIT_ALIGN_C;
         g_workMode = WORK_BT;
-        g_plotMode = 4U;
         Prompt_Start(180);
         return;
     }
@@ -988,7 +973,6 @@ static void Straight_Finish(void)
     }
 
     Control_ForcePWMZero();
-    g_plotMode = 3U;
     Prompt_Start(500);
 }
 
@@ -1039,7 +1023,6 @@ static void Arc_Start(void)
     if (!g_mpuReady) MPU_AppInit();
     if (!g_mpuReady || !g_mpuCalibrated)
     {
-        g_plotMode = 2U;
         Control_ForcePWMZero();
         Prompt_Start(900);
         return;
@@ -1050,8 +1033,7 @@ static void Arc_Start(void)
     g_arcRunMs = 0;
     g_arcStartYaw = g_yawDeg;
     g_arcDeltaYaw = 0.0f;
-    g_workMode = WORK_TRACING;
-    g_plotMode = 4U;
+    g_workMode = WORK_BT;
 
     App_Line_ResetState();
 
@@ -1074,7 +1056,6 @@ static void Arc_Finish(void)
     g_arcDone = 1;
     g_workMode = WORK_BT;
     Control_ForcePWMZero();
-    g_plotMode = 4U;
     Prompt_Start(700);
 }
 
@@ -1096,7 +1077,7 @@ static void Arc_Control10ms(void)
         return;
     }
 
-    App_Line_TracingControl10ms();
+    Control_ForcePWMZero();
 }
 #endif
 
@@ -1135,7 +1116,6 @@ static void Task2_SearchArcStart(float turnSign)
     g_straightActive = 0;
     g_arcActive = 0;
     g_workMode = WORK_BT;
-    g_plotMode = 4U;
 
     g_task2CurrentTurnSign = (turnSign < 0.0f) ? -1.0f : 1.0f;
     g_task2LineValidMs = 0;
@@ -1237,7 +1217,6 @@ static void Task2_FinishAlign(void)
         g_taskRunning = 0;
         g_taskState = TASK2_FINISH;
         g_workMode = WORK_BT;
-        g_plotMode = 3U;
         Control_ForcePWMZero();
         Prompt_Start(1000);
         return;
@@ -1377,7 +1356,7 @@ static void Task2_ControlTrace10ms(void)
     /*
      * task2 半圆弧 TRACE 阶段只读取一次灰度。
      * 在线时使用 task2 专用循迹控制；
-     * 丢线时不允许进入普通 App_Line_TracingControl10ms() 的 lostTurn 找线逻辑。
+     * 丢线时不允许继续按普通循迹找线逻辑转向。
      */
     App_Line_Update();
     forwardAbs = absf_local((float)g_forwardEncoderTotal);
@@ -1588,7 +1567,6 @@ static void Task3_SearchArcStart(float turnSign)
     g_straightActive = 0;
     g_arcActive = 0;
     g_workMode = WORK_BT;
-    g_plotMode = 4U;
 
     g_task2CurrentTurnSign = (turnSign < 0.0f) ? -1.0f : 1.0f;
     g_task2LineValidMs = 0;
@@ -1666,7 +1644,6 @@ static void Task3_StartTurnBD(void)
 
     g_taskState = TASK3_TURN_BD;
     g_workMode = WORK_BT;
-    g_plotMode = 4U;
     g_arcRunMs = 0;
     g_arcStartYaw = g_yawDeg;
     g_arcDeltaYaw = 0.0f;
@@ -1733,7 +1710,6 @@ static void Task3_FinishAlign(void)
                 g_task2AlignWaitMs = 0;
                 g_taskState = TASK4_WAIT_YAW_ZERO_NEXT_LAP;
                 g_workMode = WORK_BT;
-                g_plotMode = 4U;
                 Prompt_Start(220);
                 return;
             }
@@ -1741,7 +1717,6 @@ static void Task3_FinishAlign(void)
             g_taskRunning = 0;
             g_taskState = TASK4_FINISH;
             g_workMode = WORK_BT;
-            g_plotMode = 3U;
             Control_ForcePWMZero();
             Prompt_Start(1200);
             return;
@@ -1750,7 +1725,6 @@ static void Task3_FinishAlign(void)
         g_taskRunning = 0;
         g_taskState = TASK3_FINISH;
         g_workMode = WORK_BT;
-        g_plotMode = 3U;
         Control_ForcePWMZero();
         Prompt_Start(1000);
         return;
@@ -2187,7 +2161,6 @@ static void Task_SelectTask1(void)
     g_taskState = TASK_READY_TASK1;
     g_workMode = WORK_STANDBY;
     g_localMode = LOCAL_STANDBY;
-    g_plotMode = 3U;
     Control_ForcePWMZero();
     Prompt_Start(220);
 }
@@ -2208,7 +2181,6 @@ static void Task_SelectTask2(void)
     g_taskState = TASK_READY_TASK2;
     g_workMode = WORK_STANDBY;
     g_localMode = LOCAL_STANDBY;
-    g_plotMode = 3U;
     Control_ForcePWMZero();
     Prompt_Start(260);
 }
@@ -2324,7 +2296,6 @@ static void Task_Stop(void)
     g_taskState = TASK_IDLE;
     g_workMode = WORK_STANDBY;
     g_localMode = LOCAL_STANDBY;
-    g_plotMode = 0U;
     Control_ForcePWMZero();
     Prompt_Start(300);
 }
@@ -2337,7 +2308,6 @@ static void Local_EnterStandby(void)
 {
     g_localMode = LOCAL_STANDBY;
     g_workMode = WORK_STANDBY;
-    g_plotMode = 0U;
     Control_ForcePWMZero();
 }
 
@@ -2345,7 +2315,6 @@ static void Local_EnterMpuDebug(void)
 {
     g_localMode = LOCAL_MPU_DEBUG;
     g_workMode = WORK_STANDBY;
-    g_plotMode = 2U;
     Control_ForcePWMZero();
     if (!g_mpuReady)
     {
@@ -2393,7 +2362,6 @@ static void Local_SelectNextTask(void)
     Task_SelectOnly(g_taskSelected);
     g_localMode = LOCAL_STANDBY;
     g_workMode = WORK_STANDBY;
-    g_plotMode = 0U;
     Control_ForcePWMZero();
     Prompt_Start((uint16_t)(120U + 70U * g_taskSelected));
 }
@@ -2455,7 +2423,6 @@ static void Local_Sw4MpuDebugAndCalib(void)
     App_Control_ResetPID();
 
     Local_EnterMpuDebug();
-    g_plotMode = 2U;
 
     g_gyroZScale = 1.0f;
     g_gyroZKalmanEnable = 1U;
@@ -2482,7 +2449,6 @@ static void Local_Sw4MpuDebugAndCalib(void)
      * [slider,staticBiasTrack,0]
      */
     g_staticBiasTrackEnable = 1U;
-    g_plotMode = 2U;
     g_localMode = LOCAL_MPU_DEBUG;
     g_workMode = WORK_STANDBY;
 
@@ -2607,10 +2573,6 @@ static void Control_Run10ms(void)
         Arc_Control10ms();
     }
 #endif
-    else if (g_workMode == WORK_TRACING)
-    {
-        App_Line_TracingControl10ms();
-    }
     else
     {
         if (g_lastCmdTickMs > BT_TIMEOUT_MS)
@@ -2672,7 +2634,7 @@ static char *ModeString(void)
     if (g_taskState == TASK_FINISH || g_taskState == TASK2_FINISH ||
         g_taskState == TASK3_FINISH || g_taskState == TASK4_FINISH) return "DONE";
     if (g_taskRunning || g_straightActive || g_arcActive ||
-        TaskAuto_IsSpecialState() || g_workMode == WORK_TRACING) return "RUN";
+        TaskAuto_IsSpecialState()) return "RUN";
     return "STBY";
 }
 
@@ -2809,11 +2771,6 @@ int main(void)
             mpuUpdateCount++;
         }
 
-        if (g_plotReportMs >= PLOT_REPORT_PERIOD_MS)
-        {
-            g_plotReportMs = 0;
-        }
-
         if (g_oledRefreshMs >= OLED_REFRESH_PERIOD_MS)
         {
             g_oledRefreshMs = 0;
@@ -2835,7 +2792,6 @@ void TIM1_UP_IRQHandler(void)
 
         if (g_lastCmdTickMs < 60000U) g_lastCmdTickMs++;
         if (g_oledRefreshMs < 60000U) g_oledRefreshMs++;
-        if (g_plotReportMs < 60000U) g_plotReportMs++;
         if (g_mpuUpdateMs < 60000U) g_mpuUpdateMs++;
 
         controlDiv++;

@@ -6,10 +6,6 @@
 #define ENABLE_VERBOSE_STATUS   0U
 #define ENABLE_WEB_PID_DEBUG    0U
 #define ENABLE_LEGACY_ARCTEST   0U
-#define PLOT_MODE_MAX           4U
-#if ENABLE_WEB_PID_DEBUG
-#define PLOT_MODE_WEB_PID       5U
-#endif
 
 void App_Protocol_Process(void);
 void App_Protocol_ApplySpeedLimitPercent(float percent);

@@ -36,7 +36,6 @@ extern volatile float g_traceBaseSpeed;
 extern volatile float g_lineKp;
 extern volatile float g_lineKd;
 extern volatile float g_lineTurnLimit;
-extern volatile float g_lineLostTurn;
 extern volatile float g_lineFilterAlpha;
 extern volatile float g_lineSlowGain;
 extern volatile float g_lineEdgeTurnExtra;
@@ -66,7 +65,6 @@ extern volatile uint8_t g_safetyLocked;
 extern volatile float g_btSpeedLimitPercent;
 extern volatile float g_speedScale;
 extern volatile float g_pwmLimit;
-extern volatile uint8_t g_plotMode;
 #if ENABLE_WEB_PID_DEBUG
 extern volatile float g_speedPwm;
 extern volatile float g_diffPwm;
@@ -374,8 +372,6 @@ static void App_Protocol_ApplyFastPreset(void)
     g_lineEdgeSpeedRatio = 0.24f;
     g_forwardSlewStep = 14.0f;
     g_turnSlewStep = 60.0f;
-    g_lineLostTurn = 130.0f;
-
     g_lineTurnSign = 1.0f;
     g_lineBlackLevelF = 1.0f;
     g_lineReverseOrderF = 0.0f;
@@ -444,7 +440,6 @@ static uint8_t App_Protocol_WebPidStartControl(void)
     App_ProtocolTaskReset();
     g_workMode = WORK_BT;
     g_localMode = LOCAL_STANDBY;
-    g_plotMode = PLOT_MODE_WEB_PID;
     g_targetForwardSpeed = App_Protocol_LimitFloat(g_targetForwardSpeed, WEB_PID_TARGET_MIN, WEB_PID_TARGET_MAX);
     g_targetTurnSpeed = 0.0f;
     g_speedPwm = 0.0f;
@@ -491,8 +486,6 @@ static uint8_t App_Protocol_ApplySliderPacket(const char *name, float value)
     if (App_Protocol_IsName(name, "traceKd", "lineKd", "lineD")) { if (!App_Protocol_SetFloatRange(&g_lineKd, value, 0.0f, 1.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
     if (App_Protocol_IsName(name, "traceSpeed", "lineSpeed", "baseSpeed")) { if (!App_Protocol_SetFloatRange(&g_traceBaseSpeed, value, 0.0f, 120.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
     if (App_Protocol_IsName(name, "turnLimit", "lineTurnLimit", "traceTurnLimit")) { if (!App_Protocol_SetFloatRange(&g_lineTurnLimit, value, 0.0f, 180.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
-    if (App_Protocol_IsName(name, "lostTurn", "lineLostTurn", "findTurn")) { if (!App_Protocol_SetFloatRange(&g_lineLostTurn, value, 0.0f, 180.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
-
     if (App_Protocol_IsName(name, "filter", "lineFilter", "alpha"))
     {
         if (!App_Protocol_NormalizeRatio(value, 0.0f, 1.0f, &ratio)) return PROTO_RESULT_ERROR;
@@ -679,22 +672,6 @@ static uint8_t App_Protocol_ApplySliderPacket(const char *name, float value)
         return App_Protocol_ResultOk(1U);
     }
 
-    if (App_Protocol_IsName(name, "plotMode", "debugMode", "dbg"))
-    {
-        if (value < 0.0f || value > (float)PLOT_MODE_MAX)
-        {
-            App_Protocol_RecordError(PROTO_ERR_RANGE, "range", 1U);
-            return PROTO_RESULT_ERROR;
-        }
-        if (value < 0.5f) g_plotMode = 0U;
-        /* plotMode 1 was encoder debug; it is removed and maps to basic telemetry. */
-        else if (value < 1.5f) g_plotMode = 0U;
-        else if (value < 2.5f) g_plotMode = 2U;
-        else if (value < 3.5f) g_plotMode = 3U;
-        else g_plotMode = 4U;
-        return App_Protocol_ResultOk(1U);
-    }
-
     App_Protocol_RecordError(PROTO_ERR_UNKNOWN, "unknown", 1U);
     return PROTO_RESULT_ERROR;
 }
@@ -828,7 +805,7 @@ static uint8_t App_Protocol_ApplyPacket(char *payload)
 
         if (App_Protocol_IsName(tok[1], "presetFast", "fast", "fastPreset")) { App_Protocol_ApplyFastPreset(); return App_Protocol_ResultOk(1U); }
         if (App_Protocol_IsName(tok[1], "mpuDebug", "gyroDebug", "yawDebug")) { App_ProtocolEnterMpuDebug(); return App_Protocol_ResultOk(1U); }
-        if (App_Protocol_IsName(tok[1], "mpuCalib", "gyroCalib", "calib")) { g_plotMode = 2U; App_ProtocolMpuCalibrateGyroZ(); return App_Protocol_ResultOk(1U); }
+        if (App_Protocol_IsName(tok[1], "mpuCalib", "gyroCalib", "calib")) { App_ProtocolMpuCalibrateGyroZ(); return App_Protocol_ResultOk(1U); }
         if (App_Protocol_IsName(tok[1], "yawZero", "mpuZero", "zeroYaw")) { App_ProtocolMpuResetYaw(); App_ProtocolPromptStart(180); return App_Protocol_ResultOk(1U); }
         if (App_Protocol_IsName(tok[1], "task1", "selectTask1", "t1")) { App_ProtocolSelectTask1(); return App_Protocol_ResultOk(1U); }
         if (App_Protocol_IsName(tok[1], "task2", "selectTask2", "t2")) { App_ProtocolSelectTask2(); return App_Protocol_ResultOk(1U); }
@@ -843,7 +820,6 @@ static uint8_t App_Protocol_ApplyPacket(char *payload)
 #if ENABLE_LEGACY_ARCTEST
         if (App_Protocol_IsName(tok[1], "arcTest", "arc", "arcRun")) { App_ProtocolTaskReset(); App_ProtocolArcStart(); return App_Protocol_ResultOk(1U); }
 #endif
-        if (App_Protocol_IsName(tok[1], "tracing", "trace", "line")) { App_StartTracingMode(); return App_Protocol_ResultOk(1U); }
         if (App_Protocol_IsName(tok[1], "Bluetooth", "BT", "remote")) { return App_Protocol_ResultIgnored("ig", 1U); }
         if (App_Protocol_IsName(tok[1], "up", "forward", "fwd") ||
             App_Protocol_IsName(tok[1], "down", "backward", "back") ||
