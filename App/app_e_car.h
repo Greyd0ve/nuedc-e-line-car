@@ -51,5 +51,9 @@ uint8_t ECar_GetLapCount(void);
 uint8_t ECar_GetTargetLap(void);
 ECarState_t ECar_GetState(void);
 void ECar_PromptTick1ms(void);
+uint8_t ECar_SetTargetLap(uint8_t lap);
+uint8_t ECar_GetCornerCount(void);
+uint8_t ECar_GetFaultCode(void);
+uint32_t ECar_GetRunningTimeMs(void);
 
 #endif

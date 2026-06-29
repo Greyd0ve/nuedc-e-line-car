@@ -730,3 +730,40 @@ ECarState_t ECar_GetState(void)
 {
     return s_state;
 }
+
+uint8_t ECar_SetTargetLap(uint8_t lap)
+{
+    if (lap < E_CAR_TARGET_LAP_MIN || lap > E_CAR_TARGET_LAP_MAX)
+    {
+        return 0U;
+    }
+
+    if (ECar_IsMotionState(s_state))
+    {
+        return 0U;
+    }
+
+    s_targetLap = lap;
+    if (s_state != E_CAR_FAULT)
+    {
+        ECar_SafeStop();
+        ECar_SetState(E_CAR_READY);
+    }
+
+    return 1U;
+}
+
+uint8_t ECar_GetCornerCount(void)
+{
+    return s_cornerCount;
+}
+
+uint8_t ECar_GetFaultCode(void)
+{
+    return s_faultCode;
+}
+
+uint32_t ECar_GetRunningTimeMs(void)
+{
+    return s_runningTimeMs;
+}

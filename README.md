@@ -26,6 +26,8 @@
 - 丢线短时间内按最后误差方向找线，超时进入 FAULT 并停车。
 - OLED 显示目标圈数、已完成圈数、角点数、状态码、故障码、进度和灰度误差。
 - `ECar_GetLapProgress()` 提供 0.0~0.999 的当前圈进度接口，供后续模块同步使用。
+- HC-04 通过 USART1 作为透明串口，用网页调参工具远程修改速度、Kp、Kd 和目标圈数。
+- 每 100 ms 通过串口回传 `[plot,target,current,error,pwm]` 曲线数据。
 
 ## 已移除的 H 题内容
 
@@ -63,6 +65,8 @@ Library/    STM32F10x 标准外设库源文件
 - `User/main.c`：初始化和主循环调度。
 - `App/app_e_car.c`：E 题小车状态机、参数、全局控制变量、按键和 OLED 显示。
 - `App/app_e_car.h`：E 题小车公共接口。
+- `App/app_e_serial.c`：HC-04 / USART1 远程调参协议解析和 plot 回传。
+- `App/app_e_serial.h`：远程调参模块公共接口。
 - `App/app_control.c`：编码器速度更新、速度/转向 PID、电机 PWM 输出。
 - `App/app_line.c`：8 路灰度读取、线误差计算、灰度 PD 转向计算。
 
@@ -81,14 +85,17 @@ BeepLed_Init();
 Serial_Init();
 App_Control_Init();
 ECar_Init();
+ECar_Serial_Init();
 Timer_Init();
 ```
 
 主循环：
 
 1. `g_flag_10ms` 置位后调用 `ECar_Control10ms()`。
-2. 持续调用 `ECar_KeyProcess()`。
-3. `g_oledRefreshFlag` 置位后调用 `ECar_ShowStatus()`。
+2. 同一个 10 ms 调度中调用 `ECar_SerialPlot10ms()`，内部每 100 ms 回传一次 plot。
+3. 持续调用 `ECar_KeyProcess()`。
+4. 持续调用 `ECar_SerialProcess()` 解析串口包。
+5. `g_oledRefreshFlag` 置位后调用 `ECar_ShowStatus()`。
 
 TIM1 1ms 中断只做轻量工作：
 
@@ -218,7 +225,51 @@ USART1_RX = PA10
 Baudrate = 9600
 ```
 
-当前保留基础发送、接收环形缓冲和 `Serial_Printf()` 能力，但不保留旧 H 题串口协议。
+HC-04 作为普通透明串口模块使用：
+
+```text
+HC-04 TXD -> PA10
+HC-04 RXD -> PA9
+GND 共地
+```
+
+USART1 保持 9600 bps。当前保留基础发送、接收环形缓冲和 `Serial_Printf()` 能力，并新增 E 题远程调参协议；不保留旧 H 题串口协议和蓝牙遥控运动。
+
+网页默认调参协议映射：
+
+```text
+[slider,target,value] -> g_eCarParam.base_speed, range 0~60
+[slider,Kp,value]     -> g_eCarParam.line_kp, range 0~3
+[slider,Kd,value]     -> g_eCarParam.line_kd, range 0~8
+[slider,Ki,value]     -> target lap N, range 1~5, running state returns busy
+[key,emergency,down]  -> ECar_Stop()
+[joystick,...]        -> ignored, never drives motors
+```
+
+兼容查询和控制包：
+
+```text
+[get]
+[status]
+[start]
+[stop]
+[ecar,get]
+[ecar,status]
+[ecar,start]
+[ecar,stop]
+[ecar,set,n,value]
+```
+
+回包示例：
+
+```text
+[status,ok,set,target,30]
+[status,ok,set,Kp,0.25]
+[status,err,busy]
+[ecar,val,n,3,base,30,Kp,0.25,Kd,0.50,turnLimit,80]
+[ecar,state,s,2,n,3,lap,1,corner,5,err,-120,pwm,350,prog,30,fault,0,time,12340]
+[plot,30,28,-120,350]
+```
 
 ### 按键与声光提示
 
@@ -241,7 +292,7 @@ LED_EXT = PB5, high active
 4. `Motor_StopAll()`
 5. `App_Control_ResetPID()`
 
-上电后默认进入 E 题待机界面，不启动电机。串口接收数据不会让小车运动。
+上电后默认进入 E 题待机界面，不启动电机。`[joystick,...]` 等遥控运动包不会让小车运动。
 
 ## Keil 配置
 

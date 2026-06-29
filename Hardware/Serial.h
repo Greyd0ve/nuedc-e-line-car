@@ -1,18 +1,17 @@
-/* USART1 蓝牙/USB-TTL 串口接口。TX=PA9，RX=PA10，包含发送函数和接收环形缓冲区读取函数。 */
 #ifndef __SERIAL_H
 #define __SERIAL_H
 
-#include <stdio.h>
 #include <stdint.h>
+#include <stdio.h>
 
 void Serial_Init(void);
 uint8_t Serial_ReadByte(uint8_t *byte);
 uint32_t Serial_GetRxOverflowCount(void);
-void Serial_SendByte(uint8_t Byte);
-void Serial_SendArray(uint8_t *Array, uint16_t Length);
-void Serial_SendString(char *String);
-void Serial_SendNumber(uint32_t Number, uint8_t Length);
-void Serial_Printf(char *format, ...);
+void Serial_SendByte(uint8_t byte);
+void Serial_SendArray(const uint8_t *array, uint16_t length);
+void Serial_SendString(const char *string);
+void Serial_SendNumber(uint32_t number, uint8_t length);
+void Serial_Printf(const char *format, ...);
 
 uint8_t Serial_GetRxFlag(void);
 uint8_t Serial_GetRxData(void);

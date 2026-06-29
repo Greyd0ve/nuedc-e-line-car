@@ -74,6 +74,8 @@ E-problem application:
 
 - `App/app_e_car.c`
 - `App/app_e_car.h`
+- `App/app_e_serial.c`
+- `App/app_e_serial.h`
 
 Reusable base modules:
 
@@ -89,6 +91,7 @@ Reusable base modules:
 - `Control/pid.c`, `Control/pid.h`
 - `App/app_control.c`, `App/app_control.h`
 - `App/app_line.c`, `App/app_line.h`
+- `App/app_e_serial.c`, `App/app_e_serial.h`
 
 Removed H-problem modules:
 
@@ -134,14 +137,17 @@ BeepLed_Init();
 Serial_Init();
 App_Control_Init();
 ECar_Init();
+ECar_Serial_Init();
 Timer_Init();
 ```
 
 Main loop responsibilities:
 
 1. If `g_flag_10ms` is set, clear it and call `ECar_Control10ms()`.
-2. Call `ECar_KeyProcess()`.
-3. If `g_oledRefreshFlag` is set, clear it and call `ECar_ShowStatus()`.
+2. In the same 10 ms branch, call `ECar_SerialPlot10ms()`.
+3. Call `ECar_KeyProcess()`.
+4. Call `ECar_SerialProcess()`.
+5. If `g_oledRefreshFlag` is set, clear it and call `ECar_ShowStatus()`.
 
 TIM1 1ms interrupt responsibilities:
 
@@ -151,7 +157,7 @@ TIM1 1ms interrupt responsibilities:
 4. Set `g_flag_10ms` every 10 ms.
 5. Set `g_oledRefreshFlag` every 200 ms.
 
-Do not run the state machine, OLED refresh, serial printing, or long delays inside the interrupt.
+Do not run the state machine, serial protocol parsing, OLED refresh, serial printing, or long delays inside the interrupt.
 
 ## E-Car State Machine
 
@@ -330,7 +336,34 @@ USART1_RX = PA10
 Baudrate = 9600
 ```
 
-Serial basic send/receive support remains. The old H-problem serial task protocol is removed. Serial input must not make the car move unless a new explicit, reviewed E-car command parser is added.
+Serial basic send/receive support remains. The old H-problem serial task protocol is removed. Serial input must not implement remote joystick/manual driving; it may only tune parameters, query status, emergency-stop, and handle explicit reviewed E-car control commands.
+
+HC-04 is used as a transparent serial module:
+
+```text
+HC-04 TXD -> PA10
+HC-04 RXD -> PA9
+GND shared
+```
+
+The active E-car tuning parser is `App/app_e_serial.c`.
+
+Supported default web tuning packets:
+
+```text
+[slider,target,value] -> g_eCarParam.base_speed, range 0~60
+[slider,Kp,value]     -> g_eCarParam.line_kp, range 0~3
+[slider,Kd,value]     -> g_eCarParam.line_kd, range 0~8
+[slider,Ki,value]     -> target lap N, range 1~5
+[key,emergency,down]  -> ECar_Stop()
+[joystick,...]        -> ignored
+```
+
+`[slider,Ki,value]` must call `ECar_SetTargetLap()` and must return busy while the car is in a motion state. Do not access static E-car state variables directly from the serial module.
+
+`[joystick,...]` must never write `g_targetForwardSpeed`, `g_targetTurnSpeed`, `g_carEnable`, or motor PWM.
+
+`ECar_SerialPlot10ms()` may be called every 10 ms, but it should transmit `[plot,...]` only every 100 ms for 9600 bps HC-04 bandwidth.
 
 ### Keys
 

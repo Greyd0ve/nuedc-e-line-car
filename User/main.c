@@ -10,6 +10,7 @@
 #include "../App/app_control.h"
 #include "../App/app_line.h"
 #include "../App/app_e_car.h"
+#include "../App/app_e_serial.h"
 #include <stdint.h>
 
 #define CONTROL_PERIOD_MS          10U
@@ -32,6 +33,7 @@ int main(void)
     Serial_Init();
     App_Control_Init();
     ECar_Init();
+    ECar_Serial_Init();
     Timer_Init();
 
     OLED_Clear();
@@ -43,9 +45,11 @@ int main(void)
         {
             g_flag_10ms = 0U;
             ECar_Control10ms();
+            ECar_SerialPlot10ms();
         }
 
         ECar_KeyProcess();
+        ECar_SerialProcess();
 
         if (g_oledRefreshFlag)
         {

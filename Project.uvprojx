@@ -875,6 +875,16 @@
               <FileType>5</FileType>
               <FilePath>.\App\app_e_car.h</FilePath>
             </File>
+            <File>
+              <FileName>app_e_serial.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\App\app_e_serial.c</FilePath>
+            </File>
+            <File>
+              <FileName>app_e_serial.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\App\app_e_serial.h</FilePath>
+            </File>
           </Files>
         </Group>
       </Groups>
