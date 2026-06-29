@@ -24,8 +24,6 @@ extern volatile float g_lineKp;
 extern volatile float g_lineKd;
 extern volatile float g_lineTurnLimit;
 extern volatile float g_lineFilterAlpha;
-extern volatile float g_lineEdgeTurnExtra;
-extern volatile float g_lineMinTurn;
 
 extern volatile int16_t g_lineError;
 extern volatile uint8_t g_lineValid;
@@ -36,11 +34,6 @@ extern volatile uint16_t g_lineLostMs;
 
 static volatile float g_lineErrorFiltered = 0.0f;
 static volatile float g_lineLastCtrlError = 0.0f;
-
-static float App_Line_AbsFloat(float value)
-{
-    return (value >= 0.0f) ? value : -value;
-}
 
 static float App_Line_LimitFloat(float value, float minVal, float maxVal)
 {
@@ -184,25 +177,13 @@ float App_Line_CalcTurnCmd(void)
 {
     float error;
     float dError;
-    float desiredSign;
     float turn;
 
     error = (float)g_lineError;
     dError = error - g_lineLastCtrlError;
     g_lineLastCtrlError = error;
 
-    desiredSign = (((-g_lineTurnSign) * error) >= 0.0f) ? 1.0f : -1.0f;
     turn = (-g_lineTurnSign) * (error * g_lineKp + dError * g_lineKd);
-
-    if (App_Line_AbsFloat(error) > 70.0f && App_Line_AbsFloat(turn) < g_lineMinTurn)
-    {
-        turn = desiredSign * g_lineMinTurn;
-    }
-
-    if ((g_lineMask & 0xC3U) != 0U)
-    {
-        turn += desiredSign * g_lineEdgeTurnExtra;
-    }
 
     return App_Line_LimitFloat(turn, -g_lineTurnLimit, g_lineTurnLimit);
 }

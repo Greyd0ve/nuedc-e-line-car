@@ -30,8 +30,6 @@ extern volatile float g_forwardSpeedError;
 extern volatile int16_t g_leftPwm;
 extern volatile int16_t g_rightPwm;
 extern volatile uint8_t g_carEnable;
-extern volatile uint8_t g_straightActive;
-extern volatile uint8_t g_arcActive;
 
 extern volatile int32_t g_leftEncoderTotal;
 extern volatile int32_t g_rightEncoderTotal;
@@ -75,8 +73,6 @@ void App_Control_ResetPID(void)
 
 void App_Control_ForcePWMZero(void)
 {
-    g_straightActive = 0;
-    g_arcActive = 0;
     g_targetForwardSpeed = 0.0f;
     g_targetTurnSpeed = 0.0f;
     g_speedPwm = 0.0f;

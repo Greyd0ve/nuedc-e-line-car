@@ -711,16 +711,6 @@
           <GroupName>Hardware</GroupName>
           <Files>
             <File>
-              <FileName>LED.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>.\Hardware\LED.c</FilePath>
-            </File>
-            <File>
-              <FileName>LED.h</FileName>
-              <FileType>5</FileType>
-              <FilePath>.\Hardware\LED.h</FilePath>
-            </File>
-            <File>
               <FileName>OLED.c</FileName>
               <FileType>1</FileType>
               <FilePath>.\Hardware\OLED.c</FilePath>
@@ -749,16 +739,6 @@
               <FileName>Key.h</FileName>
               <FileType>5</FileType>
               <FilePath>.\Hardware\Key.h</FilePath>
-            </File>
-            <File>
-              <FileName>RP.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>.\Hardware\RP.c</FilePath>
-            </File>
-            <File>
-              <FileName>RP.h</FileName>
-              <FileType>5</FileType>
-              <FilePath>.\Hardware\RP.h</FilePath>
             </File>
             <File>
               <FileName>Motor.c</FileName>
@@ -801,16 +781,6 @@
               <FilePath>.\Hardware\Serial.h</FilePath>
             </File>
             <File>
-              <FileName>BT_proto.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>.\Hardware\BT_proto.c</FilePath>
-            </File>
-            <File>
-              <FileName>BT_proto.h</FileName>
-              <FileType>5</FileType>
-              <FilePath>.\Hardware\BT_proto.h</FilePath>
-            </File>
-            <File>
               <FileName>Grayscale.c</FileName>
               <FileType>1</FileType>
               <FilePath>.\Hardware\Grayscale.c</FilePath>
@@ -819,16 +789,6 @@
               <FileName>Grayscale.h</FileName>
               <FileType>5</FileType>
               <FilePath>.\Hardware\Grayscale.h</FilePath>
-            </File>
-            <File>
-              <FileName>MPU6050.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>.\Hardware\MPU6050.c</FilePath>
-            </File>
-            <File>
-              <FileName>MPU6050.h</FileName>
-              <FileType>5</FileType>
-              <FilePath>.\Hardware\MPU6050.h</FilePath>
             </File>
             <File>
               <FileName>BeepLed.c</FileName>
@@ -906,24 +866,14 @@
               <FilePath>.\App\app_line.h</FilePath>
             </File>
             <File>
-              <FileName>app_state.c</FileName>
+              <FileName>app_e_car.c</FileName>
               <FileType>1</FileType>
-              <FilePath>.\App\app_state.c</FilePath>
+              <FilePath>.\App\app_e_car.c</FilePath>
             </File>
             <File>
-              <FileName>app_state.h</FileName>
+              <FileName>app_e_car.h</FileName>
               <FileType>5</FileType>
-              <FilePath>.\App\app_state.h</FilePath>
-            </File>
-            <File>
-              <FileName>app_protocol.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>.\App\app_protocol.c</FilePath>
-            </File>
-            <File>
-              <FileName>app_protocol.h</FileName>
-              <FileType>5</FileType>
-              <FilePath>.\App\app_protocol.h</FilePath>
+              <FilePath>.\App\app_e_car.h</FilePath>
             </File>
           </Files>
         </Group>
